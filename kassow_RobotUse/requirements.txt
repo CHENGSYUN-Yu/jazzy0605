@@ -1,0 +1,11 @@
+dearpygui==2.3.1
+numpy==2.4.6
+pillow==12.2.0
+PyOpenGL==3.1.0
+pyrealsense2==2.58.1.10581
+pyrender==0.1.45
+PyYAML==6.0.3
+scipy==1.17.1
+trimesh==4.12.2
+watchdog==6.0.0
+yourdfpy==0.0.60

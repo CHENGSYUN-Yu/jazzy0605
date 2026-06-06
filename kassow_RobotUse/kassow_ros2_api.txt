@@ -1,0 +1,302 @@
+================================================================
+  Kassow KR810 雙臂機器人  ROS2 通訊指令整理
+  更新：2026-06-05
+================================================================
+
+── 基本設定 ─────────────────────────────────────────────────────
+  ROS 版本       : ROS2 Jazzy
+  左臂 Domain ID : 0    IP: 192.168.38.2
+  右臂 Domain ID : 1    IP: 192.168.38.1
+  kr_msgs 路徑   : ~/ros2_ws/install/kr_msgs/
+
+  設定 Domain ID：
+    export ROS_DOMAIN_ID=1
+
+================================================================
+  TOPICS（發布 / 訂閱）
+================================================================
+
+── /kr/system/state  [訂閱] ─────────────────────────────────────
+  型別：kr_msgs/msg/SystemState
+  說明：機器人完整狀態（每控制週期更新）
+
+  欄位：
+    robot_mode        RobotMode    MANUAL=0, AUTONOMOUS=1
+    robot_state       RobotState   INIT=1, STANDBY=2, MOVING=3,
+                                   BACKDRIVE=4, SUSPENDED=5, ALARM=6
+    sensed_pos[7]     float64      感測關節位置 [度]
+    sensed_vel[7]     float64      感測關節速度 [度/s]
+    sensed_trq[7]     float64      感測關節扭矩
+    target_pos[7]     float64      目標關節位置 [度]
+    target_vel[7]     float64      目標關節速度
+    target_trq[7]     float64      目標關節扭矩
+    pos[3]            float64      TCP 位置 x,y,z [mm]
+    rot[3]            float64      TCP 姿態 r,p,y [度]
+    e_stop            bool         緊急停止
+    p_stop            bool         保護停止
+    toggle            bool         切換
+    backdrive         bool         反向驅動
+    iob_digital_out[8], iob_relays[4], iob_current_out[2], ...
+    tio_digital_out[4], tio_power_supply[3], ...
+
+  範例（讀取一次）：
+    ros2 topic echo /kr/system/state kr_msgs/msg/SystemState --once
+
+  範例（持續追蹤）：
+    ros2 topic echo /kr/system/state kr_msgs/msg/SystemState
+
+── /kr/motion/jog_joint  [發布，需 20Hz 連續發送] ────────────────
+  型別：kr_msgs/msg/JogJoint
+  說明：關節速度控制，停止發送即停止
+
+  欄位：
+    jsvel[7]  float64  各關節目標速度 [度/s]
+
+  範例（J7 以 10度/s 轉動）：
+    ros2 topic pub /kr/motion/jog_joint kr_msgs/msg/JogJoint \
+      '{"jsvel": [0.0,0.0,0.0,0.0,0.0,0.0,10.0]}' --rate 20
+
+── /kr/motion/jog_linear  [發布，需 20Hz 連續發送] ──────────────
+  型別：kr_msgs/msg/JogLinear
+  說明：TCP 線性速度控制，停止發送即停止
+
+  欄位：
+    vel[3]  float64  TCP 線速度 x,y,z [mm/s]
+    rot[3]  float64  TCP 角速度 r,p,y [度/s]
+
+  範例（沿 X 軸以 50mm/s 移動）：
+    ros2 topic pub /kr/motion/jog_linear kr_msgs/msg/JogLinear \
+      '{"vel":[50.0,0.0,0.0],"rot":[0.0,0.0,0.0]}' --rate 20
+
+── /kr/motion/follow_joint  [發布，單次] ────────────────────────
+  型別：kr_msgs/msg/FollowJoint
+  說明：關節空間點位移動（非阻塞，發送後機器人自行完成）
+
+  欄位：
+    jsconf[7]  float64  目標關節位置 [度]
+    ttype      int8     追蹤類型  TT_VEL=0（速度）, TT_TIME=1（時間）
+    tvalue     float64  速度 [度/s] 或 時間 [s]
+    bpoint     int8     混合點  BP_STOP=0（停止）, BP_VIA=1（經由點）
+    btype      int8     混合類型  BT_ACC=0（加速度）, BT_TIME=1（時間）
+    bvalue     float64  混合值 [度/s² 或 s]
+
+  範例（以 30度/s 移至 [0,0,0,0,0,0,0]）：
+    ros2 topic pub /kr/motion/follow_joint kr_msgs/msg/FollowJoint \
+      '{"jsconf":[0,0,0,0,0,0,0],"ttype":0,"tvalue":30.0,
+        "bpoint":0,"btype":0,"bvalue":0.0}' --times 1
+
+── /kr/motion/follow_linear  [發布，單次] ───────────────────────
+  型別：kr_msgs/msg/FollowLinear
+  說明：工作空間點位移動（非阻塞）
+
+  欄位：
+    pos[3]   float64  目標位置 x,y,z [mm]
+    rot[3]   float64  目標姿態 r,p,y [度]
+    ref      int8     座標系  WORLD=0, BASE=1, TCP=2
+    ttype    int8     TT_VEL=0, TT_TIME=1
+    tvalue   float64  速度 [mm/s] 或 時間 [s]
+    bpoint   int8     BP_STOP=0, BP_VIA=1
+    btype    int8     BT_ACC=0, BT_TIME=1, BT_RAD=2（半徑）
+    bvalue   float64  [m/s², s, mm]
+
+  範例（BASE 座標系，以 50mm/s 移至目標）：
+    ros2 topic pub /kr/motion/follow_linear kr_msgs/msg/FollowLinear \
+      '{"pos":[100.0,0.0,500.0],"rot":[0.0,0.0,0.0],
+        "ref":1,"ttype":0,"tvalue":50.0,
+        "bpoint":0,"btype":0,"bvalue":0.0}' --times 1
+
+── /kr/motion/heartbeat  [發布] ─────────────────────────────────
+  型別：kr_msgs/msg/MotionHeartbeat（空訊息）
+  說明：心跳，需定期發送維持連線
+
+── /kr/motion/self_motion  [發布] ───────────────────────────────
+  型別：kr_msgs/msg/SelfMotion
+  欄位：speed float64（自運動速度）
+
+── /kr/program/interact  [發布] ─────────────────────────────────
+  型別：kr_msgs/msg/ProgramInteract（程式互動）
+
+================================================================
+  SERVICES（服務呼叫）
+================================================================
+
+── /kr/system/get_master_speed ──────────────────────────────────
+  型別：kr_msgs/srv/GetMasterSpeed
+  說明：取得教導盒速度設定
+
+  Response：
+    speed    float64  速度比例 0.0~1.0（0.28 = 28%）
+    success  bool
+
+  範例：
+    ros2 service call /kr/system/get_master_speed \
+      kr_msgs/srv/GetMasterSpeed
+
+── /kr/system/get_robot_mode ────────────────────────────────────
+  型別：kr_msgs/srv/GetRobotMode
+  Response：mode（MANUAL=0 / AUTONOMOUS=1）, success
+
+── /kr/system/get_robot_state ───────────────────────────────────
+  型別：kr_msgs/srv/GetRobotState
+  Response：state（STANDBY=2, MOVING=3, ALARM=6…）, success
+
+── /kr/system/get_safety_mode ───────────────────────────────────
+  型別：kr_msgs/srv/GetSafetyMode
+
+── /kr/system/get_safety_zones ──────────────────────────────────
+  型別：kr_msgs/srv/GetSafetyZones
+
+── /kr/system/suspend ───────────────────────────────────────────
+  型別：kr_msgs/srv/SuspendRobot（軟停機器人）
+
+── /kr/system/unlock ────────────────────────────────────────────
+  型別：kr_msgs/srv/UnlockRobot
+
+── /kr/system/unsuspend ─────────────────────────────────────────
+  型別：kr_msgs/srv/UnsuspendRobot
+
+── /kr/system/log_alarm ─────────────────────────────────────────
+  型別：kr_msgs/srv/LogAlarm
+
+── /kr/robot/get_robot_pose ─────────────────────────────────────
+  型別：kr_msgs/srv/GetRobotPose
+  說明：取得機器人當前精確位置
+
+  Response：
+    pos[3]     float64  x,y,z [mm]
+    rot[3]     float64  r,p,y [度]
+    jsconf[7]  float64  關節角度 [度]
+    success    bool
+
+  範例：
+    ros2 service call /kr/robot/get_robot_pose \
+      kr_msgs/srv/GetRobotPose
+
+── /kr/robot/get_system_frame ───────────────────────────────────
+── /kr/robot/set_system_frame ───────────────────────────────────
+  型別：kr_msgs/srv/Get/SetSystemFrame（系統座標系）
+
+── /kr/robot/get_system_load ────────────────────────────────────
+── /kr/robot/set_system_load ────────────────────────────────────
+  型別：kr_msgs/srv/Get/SetSystemLoad（工具質量/重心設定）
+
+── /kr/motion/move_linear ───────────────────────────────────────
+  型別：kr_msgs/srv/MoveLinear
+  說明：工作空間點位移動（阻塞，直到完成才回傳）
+
+  Request：
+    pos[3]    float64  目標位置 [mm]
+    rot[3]    float64  目標姿態 [度]
+    ref       int8     WORLD=0, BASE=1, TCP=2
+    ttype     int8     TT_VEL=0, TT_TIME=1
+    tvalue    float64  速度 [mm/s] 或 時間 [s]
+    bpoint    int8     BP_STOP=0
+    btype     int8     BT_ACC=0
+    bvalue    float64
+    sync      float64
+    chaining  int8     CH_INT=0（中斷前一動作）, CH_COM=1（等待完成）
+  Response：success bool
+
+── /kr/motion/move_joint ────────────────────────────────────────
+  型別：kr_msgs/srv/MoveJoint
+  說明：關節空間點位移動（阻塞）
+
+  Request：
+    jsconf[7]  float64  目標關節角度 [度]
+    ttype      int8     TT_VEL=0
+    tvalue     float64  速度 [度/s]
+    bpoint     int8     BP_STOP=0
+    btype      int8     BT_ACC=0
+    bvalue     float64
+    sync       float64
+    chaining   int8     CH_INT=0
+  Response：success bool
+
+── /kr/motion/move_spline ───────────────────────────────────────
+  型別：kr_msgs/srv/MoveSpline（樣條曲線移動，阻塞）
+
+── /kr/motion/pause ─────────────────────────────────────────────
+  型別：kr_msgs/srv/PauseMotion（暫停運動）
+  範例：ros2 service call /kr/motion/pause kr_msgs/srv/PauseMotion
+
+── /kr/motion/resume ────────────────────────────────────────────
+  型別：kr_msgs/srv/ResumeMotion（恢復運動）
+
+── /kr/motion/terminate ─────────────────────────────────────────
+  型別：kr_msgs/srv/TerminateMotion（終止運動）
+
+── /kr/motion/select_jogging_frame ──────────────────────────────
+  型別：kr_msgs/srv/SelectJoggingFrame
+  Request：ref int8（WORLD=0, BASE=1, TCP=2）
+
+── /kr/motion/set_interactivity ─────────────────────────────────
+  型別：kr_msgs/srv/SetInteractivity
+  Request：enable bool
+
+── /kr/motion/set_custom_frame ──────────────────────────────────
+  型別：kr_msgs/srv/SetCustomFrame
+
+── /kr/iob/*  IOBoard IO ────────────────────────────────────────
+  /kr/iob/config_quadrature_input
+  /kr/iob/get_current_input
+  /kr/iob/get_digital_input
+  /kr/iob/get_quadrature_input
+  /kr/iob/get_safe_input
+  /kr/iob/get_voltage_input
+  /kr/iob/set_current_output
+  /kr/iob/set_digital_output
+  /kr/iob/set_relay_output
+  /kr/iob/set_voltage_output
+
+── /kr/tio/*  Tool IO ───────────────────────────────────────────
+  /kr/tio/config_analog_output
+  /kr/tio/config_digital_output
+  /kr/tio/config_power_supply
+  /kr/tio/get_current_input
+  /kr/tio/get_voltage_input
+  /kr/tio/set_analog_output
+  /kr/tio/set_digital_output
+  /kr/tio/set_power_supply
+
+── /kr/base/*  參數服務 ──────────────────────────────────────────
+  /kr/base/describe_parameters
+  /kr/base/get_parameter_types
+  /kr/base/get_parameters
+  /kr/base/list_parameters
+  /kr/base/set_parameters
+  /kr/base/set_parameters_atomically
+
+── /kr/program/*  程式控制 ──────────────────────────────────────
+  /kr/program/get_state
+  /kr/program/pause
+  /kr/program/recover
+  /kr/program/resume
+  /kr/program/step
+  /kr/program/stop
+
+================================================================
+  關節名稱（URDF）
+================================================================
+
+  左臂：
+    Left_joint_1  Left_joint_2  Left_joint_3  Left_jont_4（typo！無 i）
+    Left_joint_5  Left_joint_6  Left_joint_7
+
+  右臂：
+    Right_joint_1  Right_joint_2  Right_joint_3  Right_joint_4
+    Right_joint_5  Right_joint_6  Right_link_7
+
+  ⚠ Left_jont_4 及 Right_joint_4 在 URDF 中 axis 與機器人實際方向相反，
+    送 RobotViewer 前需取負值。
+
+================================================================
+  注意事項
+================================================================
+
+  1. jog_joint / jog_linear 需持續以 ≥20Hz 發送；停止發送機器人即停止。
+  2. follow_linear / follow_joint 是單次點位命令，發送後機器人自行完成。
+  3. move_linear / move_joint 是同步服務呼叫，阻塞直到動作完成或超時。
+  4. ROS_DOMAIN_ID 必須對應手臂（左=0，右=1），否則無法通訊。
+  5. 連線後請先 get_master_speed 同步教導盒速度。
+  6. 步進點動使用 follow_linear（ref=1 BASE座標系），
+     需先同步位置（SystemState.pos/rot）再計算目標。
