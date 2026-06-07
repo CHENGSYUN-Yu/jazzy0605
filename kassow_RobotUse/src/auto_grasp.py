@@ -38,6 +38,14 @@ from src.depth_reader        import DepthReader
 from src.pixel2headcam       import Pixel2HeadCam
 from src.headcam2base        import HeadCam2Base
 from src.angle2rz            import Angle2Rz
+from src.pose_offset         import PoseOffset
+from src.yolo_engine         import YoloEngine
+from src.yolo_detect_handcam import YoloDetectHandcam   # 備用
+from src.get_depth_handcam   import GetDepthHandcam
+from src.pixel2handcam       import Pixel2HandCam
+from src.handcam2flange      import HandCam2Flange
+from src.angle2rz_handcam    import Angle2RzHandcam
+from src.flange2base         import Flange2Base
 from src.ros2_node           import get_ros2_node
 
 # ── 路徑 ──────────────────────────────────────────────────────────────────────
@@ -92,10 +100,34 @@ class AutoGrasp:
         ag.tick()
     """
 
-    def __init__(self, arm_ctrl=None, domain_id: int = 1, yolo_engine=None):
+    def __init__(self, arm_ctrl=None, domain_id: int = 1):
         self._arm        = arm_ctrl
         self._domain_id  = domain_id
-        self._yolo       = yolo_engine   # YoloEngine（由 app 注入）
+
+        # ── YOLO 偵測物件（各自獨立）─────────────────────────────────────────
+        self._head_detector = YoloEngine(MODEL_PATH, cam_id=0, fps=10.0)  # D435I 頭部
+        self._hand_detector = YoloEngine(MODEL_PATH, cam_id=1, fps=10.0)  # D405 手部
+
+        # ── 目標位姿硬性補償（套用在 Cam2Flange 之前）────────────────────────
+        self._pose_offset = PoseOffset(dx=25.0)   # 手部相機接近點 x +25mm
+
+        # ── 手腕相機物件鏈 ────────────────────────────────────────────────────
+        self._handcam_det   = YoloDetectHandcam(model_path=MODEL_PATH)
+        self._handcam_depth = GetDepthHandcam()
+        self._p2h           = Pixel2HandCam()
+        self._h2f           = HandCam2Flange()
+        self._a2rz_h        = Angle2RzHandcam()
+        self._f2b           = Flange2Base()
+        self._which_first_h = WhichFirstHandcam()
+        self._handcam_selected = None
+        self._handcam_dets: list = []
+        self._last_handcam_t = 0.0
+        try:
+            self._h2f.load_T(EIH_T_PATH)
+            self._a2rz_h.load_T(EIH_T_PATH)
+            print(f'[AutoGrasp] EIH T_matrix 載入成功（手腕相機鏈）')
+        except Exception as e:
+            print(f'[AutoGrasp] EIH T_matrix 載入失敗：{e}')
 
         # ── 頭部相機座標轉換鏈 ────────────────────────────────────────────────
         self._depth_reader = DepthReader()
@@ -163,12 +195,16 @@ class AutoGrasp:
         self._use_move_linear = False   # True = MoveLinear 服務；False = jog P-control
 
     def set_realsense(self, rs) -> None:
-        """由 app 注入 RealSense 物件（取得深度幀和內參用）。"""
+        """由 app 注入 RealSense 物件，同時啟動兩個 YOLO 偵測器。"""
         self._rs = rs
+        self._head_detector.start(rs)
+        self._hand_detector.start(rs)
 
-    def _on_conf_thresh_change(self, sender, app_data) -> None:
-        if self._yolo is not None:
-            self._yolo.set_conf_threshold(float(app_data))
+    def _on_conf_thresh_cam0(self, sender, app_data) -> None:
+        self._head_detector.set_conf_threshold(float(app_data))
+
+    def _on_conf_thresh_cam1(self, sender, app_data) -> None:
+        self._hand_detector.set_conf_threshold(float(app_data))
 
     def _on_yaw_offset_change(self, sender, app_data) -> None:
         self._yaw_offset_deg = float(app_data)
@@ -178,10 +214,8 @@ class AutoGrasp:
     # ═════════════════════════════════════════════════════════════════════════
 
     def _get_cam0_dets(self) -> list:
-        """讀取 cam0（頭部相機，GUI Cam 1）最新偵測結果。"""
-        if self._yolo is None:
-            return []
-        return self._yolo.get_dets(0)
+        """讀取頭部相機（D435I）最新偵測結果。"""
+        return self._head_detector.get_dets()
 
     def _try_inject_detection(self) -> None:
         """
@@ -348,14 +382,23 @@ class AutoGrasp:
             dpg.add_separator()
             dpg.add_spacer(height=4)
 
-            # ── 信心分門檻滑桿 ───────────────────────────────────────────────
-            dpg.add_text('YOLO 信心分門檻：', color=(180, 180, 180))
+            # ── 信心分門檻滑桿（兩台相機各自可調）──────────────────────────
+            dpg.add_text('信心分門檻 — Cam 1 頭部相機：', color=(180, 180, 180))
             dpg.add_slider_float(
-                tag='ag_conf_thresh',
-                default_value=0.5,
+                tag='ag_conf_thresh_cam0',
+                default_value=0.15,
                 min_value=0.05, max_value=0.99,
                 width=iw, format='%.2f',
-                callback=self._on_conf_thresh_change,
+                callback=self._on_conf_thresh_cam0,
+            )
+            dpg.add_spacer(height=4)
+            dpg.add_text('信心分門檻 — Cam 2 手部相機：', color=(180, 180, 180))
+            dpg.add_slider_float(
+                tag='ag_conf_thresh_cam1',
+                default_value=0.50,
+                min_value=0.05, max_value=0.99,
+                width=iw, format='%.2f',
+                callback=self._on_conf_thresh_cam1,
             )
             dpg.add_spacer(height=6)
 
@@ -401,19 +444,30 @@ class AutoGrasp:
                 dpg.set_value('ag_rot_line',
                               f'R: {rot[0]:.2f}  P: {rot[1]:.2f}  Yaw: {rot[2]:.2f}')
 
+        # 手腕相機偵測階段：限速 10fps
+        if self._phase == 'handcam_detecting':
+            now = time.monotonic()
+            if now - self._last_handcam_t >= 0.1:
+                self._last_handcam_t = now
+                self._process_handcam()
+
         # YOLO + 夾取計數狀態
         if dpg.does_item_exist('ag_status_line'):
             count = self._mem.total_recorded if self._mem else 0
-            if self._yolo is None:
-                yolo_txt = 'YOLO: 未啟動'
-            elif self._yolo.load_error:
-                yolo_txt = f'YOLO: ❌ {self._yolo.load_error[:40]}'
-            elif not self._yolo.is_loaded:
+            h_err = self._head_detector.load_error
+            h_ok  = self._head_detector.is_loaded
+            a_err = self._hand_detector.load_error
+            a_ok  = self._hand_detector.is_loaded
+            if h_err or a_err:
+                yolo_txt = f'YOLO: ❌ {(h_err or a_err)[:40]}'
+            elif not (h_ok and a_ok):
                 yolo_txt = 'YOLO: ⏳ 載入中...'
             else:
-                n0 = self._yolo.get_det_count(0)
-                n1 = self._yolo.get_det_count(1)
-                yolo_txt = f'YOLO: ✅ Cam1(頭):{n0}  Cam2(手):{n1}'
+                n0 = self._head_detector.get_det_count()
+                n1 = self._hand_detector.get_det_count()
+                t0 = self._head_detector.conf_threshold
+                t1 = self._hand_detector.conf_threshold
+                yolo_txt = f'YOLO: ✅ 頭:{n0}[≥{t0:.2f}]  手:{n1}[≥{t1:.2f}]'
                 self._try_inject_detection()
             dpg.set_value('ag_status_line',
                           f'已夾取: {count}/3  |  {yolo_txt}')
@@ -471,7 +525,7 @@ class AutoGrasp:
             self._mem.reset()
         self._log('[INFO] 自動夾取流程啟動')
 
-        yolo_ready = (self._yolo is not None and self._yolo.is_loaded)
+        yolo_ready = (self._head_detector.is_loaded and self._hand_detector.is_loaded)
         rs_ready   = (self._rs is not None)
 
         if yolo_ready and rs_ready:
@@ -508,7 +562,8 @@ class AutoGrasp:
         elif p == 'confirm_target':
             self._step_start_moving('moving_approach', self._step_after_approach)
         elif p == 'confirm_arrived':
-            # Phase 1：跳過手腕相機，直接計算夾取位姿
+            self._step_start_handcam_detect()
+        elif p == 'confirm_handcam':
             self._step_compute_grasp()
         elif p == 'confirm_grasp_target':
             self._step_start_moving('moving_grasp', self._step_after_grasp)
@@ -577,21 +632,38 @@ class AutoGrasp:
     # ═════════════════════════════════════════════════════════════════════════
 
     def _step_compute_target(self) -> None:
-        # 頭部相機偵測結果已在 base frame，TargetZCompute 直接 +300mm z
-        # Cam2Flange 只用於手腕相機（EIH）流程，頭部相機不需要
-        approach = self._tz_compute.compute(self._auto_selected)
-        if approach is None:
+        # Step 1：TargetZCompute → 手部相機應到達的位置（器械上方 300mm，base frame）
+        cam_target = self._tz_compute.compute(self._auto_selected)
+        if cam_target is None:
             self._set_phase('stopped', '❌ TargetZCompute 失敗')
             return
-        self._auto_target = approach
+
+        # Step 2：PoseOffset → 硬性補償相機目標位置（x+20mm）
+        cam_target = self._pose_offset.apply(cam_target)
+
+        # Step 3：Cam2Flange → 補償手部相機與法蘭的偏移
+        # 確保手部相機（而非法蘭面）對準器械正上方
+        if self._c2f.is_ready:
+            flange_target = self._c2f.compute(cam_target)
+            if flange_target is None:
+                self._set_phase('stopped', '❌ Cam2Flange 計算失敗')
+                return
+        else:
+            flange_target = cam_target   # T_matrix 未載入時直接用（不補償）
+
+        self._auto_target = flange_target
 
         det_pos = self._auto_selected.get('pos_base_mm', [0, 0, 0])
+        off = self._pose_offset.offset
+        raw_cam = cam_target['source'] if 'source' in cam_target else cam_target
         txt = (
-            f'接近目標（器械上方 {self._tz_compute._z_offset:.0f}mm）：\n'
-            f'  器械 base = [{det_pos[0]:.1f}, {det_pos[1]:.1f}, {det_pos[2]:.1f}]\n'
-            f'  接近目標  = [{approach["x_mm"]:.1f}, {approach["y_mm"]:.1f}, {approach["z_mm"]:.1f}]\n'
-            f'  Δz = {approach["z_mm"] - det_pos[2]:.1f} mm\n'
-            f'  yaw = {approach["yaw_deg"]:.1f}°\n\n'
+            f'接近目標（手部相機對準器械上方 {self._tz_compute._z_offset:.0f}mm）：\n'
+            f'  器械 base  = [{det_pos[0]:.1f}, {det_pos[1]:.1f}, {det_pos[2]:.1f}]\n'
+            f'  相機目標   = [{cam_target["x_mm"]:.1f}, {cam_target["y_mm"]:.1f}, {cam_target["z_mm"]:.1f}]'
+            f'  (offset dx={off["dx"]:+.1f} dy={off["dy"]:+.1f} dz={off["dz"]:+.1f})\n'
+            f'  法蘭目標   = [{flange_target["x_mm"]:.1f}, {flange_target["y_mm"]:.1f}, {flange_target["z_mm"]:.1f}]'
+            f'{"" if self._c2f.is_ready else "  ⚠ T_cam2gripper 未載入"}\n'
+            f'  yaw = {flange_target["yaw_deg"]:.1f}°\n\n'
             f'按「確認繼續」開始移動'
         )
         self._set_phase('confirm_target', txt)
@@ -648,7 +720,7 @@ class AutoGrasp:
 
         node = get_ros2_node(self._domain_id)
         pos = [target['x_mm'], target['y_mm'], target['z_mm']]
-        rot = [0.0, 0.0, target['yaw_deg']]
+        rot = [0.0, 0.0, 0.0]  # 暫時停用 Rz
         self._log(f'MoveLinear 發送中... pos={[round(v,1) for v in pos]} yaw={rot[2]:.1f}°')
         ok  = node.call_move_linear(pos, rot, speed_mm_s=speed, ref=1,
                                     timeout_sec=60.0)
@@ -684,9 +756,85 @@ class AutoGrasp:
         txt = (
             f'✅ 已到達器械上方\n'
             f'  x={pos[0]:.1f}  y={pos[1]:.1f}  z={pos[2]:.1f} mm\n\n'
-            f'確認位置後按「確認繼續」（計算夾取位姿）'
+            f'按「確認繼續」啟動手腕相機偵測'
         )
         self._set_phase('confirm_arrived', txt)
+
+    # ── 手腕相機偵測 ──────────────────────────────────────────────────────────
+
+    def _step_start_handcam_detect(self) -> None:
+        """啟動手腕相機偵測階段（使用 YoloEngine cam1 已有的偵測結果）。"""
+        self._handcam_selected = None
+        self._handcam_dets = []
+        self._last_handcam_t = 0.0
+        self._set_phase('handcam_detecting', '🔍 手腕相機偵測中，等待穩定結果...')
+
+    def _process_handcam(self) -> None:
+        """
+        手腕相機偵測處理，由 tick() 在 handcam_detecting 階段限速呼叫。
+        使用 YoloEngine cam1 已有的偵測結果（避免重複推論）。
+        """
+        if self._rs is None or self._arm is None:
+            return
+
+        # 直接取手部相機偵測器的結果
+        dets = self._hand_detector.get_dets()
+        if not dets:
+            self._log('[手腕相機] 未偵測到目標...')
+            return
+
+        # 只取 stable=True 的偵測
+        stable_dets = [d for d in dets if d.get('stable')]
+        if not stable_dets:
+            self._log(f'[手腕相機] 偵測數: {len(dets)}，等待穩定中...')
+            return
+
+        # 取深度幀和內參
+        depth = self._rs.get_depth_frame(1)
+        intr  = self._rs.get_intrinsics(1)
+        if depth is None or intr is None:
+            self._log('[手腕相機] 深度圖或內參未就緒')
+            return
+
+        # 設定 D405 內參
+        self._p2h.set_intrinsics(
+            intr['fx'], intr['fy'], intr['cx'], intr['cy'])
+
+        # 更新 Flange2Base 即時手臂位姿
+        pos = self._arm.current_pos
+        rot = self._arm.current_rot
+        if pos and rot:
+            self._f2b.update_arm_pose(pos, rot)
+
+        # 座標轉換鏈
+        import copy
+        dets = copy.deepcopy(stable_dets)
+        for det in dets:
+            det['depth_mm'] = self._handcam_depth.get_depth(det['center'], depth)
+        dets = self._p2h.project_all(dets)       # → pos_cam_mm
+        dets = self._h2f.transform_all(dets)     # → pos_flange_mm
+        dets = self._a2rz_h.convert_all(dets)    # → yaw_deg, Rz（法蘭座標系）
+        dets = self._f2b.transform_all(dets)     # → pos_base_mm, yaw_base_deg
+        dets = [d for d in dets if d.get('pos_base_mm')]
+        self._handcam_dets = dets
+
+        if not dets:
+            self._log('[手腕相機] 座標轉換失敗')
+            return
+
+        first = self._which_first_h.get_first(dets)
+        if first:
+            self._handcam_selected = first
+            pos_b = first.get('pos_base_mm', [0, 0, 0])
+            txt = (
+                f'手腕相機偵測結果（YoloEngine cam1）：\n'
+                f'  conf     = {first["conf"]:.2f}\n'
+                f'  depth    = {first.get("depth_mm", 0):.0f} mm\n'
+                f'  pos_base = {[round(v, 1) for v in pos_b]}\n'
+                f'  yaw      = {round(first.get("yaw_base_deg") or 0, 1)}°\n\n'
+                f'按「確認繼續」計算夾取位姿'
+            )
+            self._set_phase('confirm_handcam', txt)
 
     def _step_compute_grasp(self) -> None:
         source = self._handcam_selected or self._auto_selected
@@ -838,7 +986,7 @@ class AutoGrasp:
 
             t   = time.monotonic() - self._auto_t0
             cmd = self._exec_motion.compute(t, pos, rot, self._traj_plan)
-            node.publish_jog(cmd['vel'], cmd['rot'])
+            node.publish_jog(cmd['vel'], [0.0, 0.0, 0.0])  # 暫時停用 Rz
 
             if cmd['done']:
                 arrived = self._check_arrive.update(pos, rot, time.monotonic())
@@ -865,5 +1013,7 @@ class AutoGrasp:
 
     def cleanup(self) -> None:
         self._motion_running = False
+        self._head_detector.stop()
+        self._hand_detector.stop()
         node = get_ros2_node(self._domain_id)
         node.publish_stop()

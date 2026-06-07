@@ -8,9 +8,63 @@ import threading
 from src.arm_controller import (ArmController, _NEGATE_FOR_VIEWER,
                                _LEFT_JOINT_LABELS, _RIGHT_JOINT_LABELS)
 from src.auto_grasp import AutoGrasp
-from src.yolo_engine import YoloEngine
 from src.ros2_node import get_ros2_node
 from src.logger import Logger
+
+
+class _DualYolo:  # 已不使用，保留備查
+    def __init__(self, head, hand):
+        self._head = head  # cam_id=0 D435I
+        self._hand = hand  # cam_id=1 D405
+
+    def _get(self, cam_id: int):
+        return self._head if cam_id == 0 else self._hand
+
+    # 結果存取
+    def get_overlay_tex(self, cam_id: int):
+        return self._get(cam_id).get_overlay_tex()
+
+    def get_dets(self, cam_id: int) -> list:
+        return self._get(cam_id).get_dets()
+
+    def get_det_count(self, cam_id: int) -> int:
+        return self._get(cam_id).get_det_count()
+
+    # 狀態
+    @property
+    def is_loaded(self) -> bool:
+        return self._head.is_loaded and self._hand.is_loaded
+
+    @property
+    def load_error(self) -> 'str | None':
+        return self._head.load_error or self._hand.load_error
+
+    # 信心分門檻
+    def set_conf_threshold(self, val: float, cam_id: int = 0) -> None:
+        self._get(cam_id).set_conf_threshold(val)
+
+    def get_conf_threshold(self, cam_id: int = 0) -> float:
+        return self._get(cam_id).conf_threshold
+
+    # ROI（只有頭部相機有 GUI 設定）
+    def set_roi(self, cam_id: int, x1, y1, x2, y2) -> None:
+        self._get(cam_id).set_roi(x1, y1, x2, y2)
+
+    def clear_roi(self, cam_id: int) -> None:
+        self._get(cam_id).clear_roi()
+
+    def get_roi(self, cam_id: int):
+        return self._get(cam_id).get_roi()
+
+    def set_preview_roi(self, cam_id: int, x1, y1, x2, y2) -> None:
+        self._get(cam_id).set_preview_roi(x1, y1, x2, y2)
+
+    def clear_preview_roi(self, cam_id: int) -> None:
+        self._get(cam_id).clear_preview_roi()
+
+    def stop(self) -> None:
+        self._head.stop()
+        self._hand.stop()
 from src.realsense import RealSense
 from src.robot_viewer import RobotViewer
 
@@ -94,16 +148,11 @@ class App:
         self._roi_press_tex = None    # 按下時的材質座標 (x, y)
         self._roi_drag_tex  = None    # 目前拖移位置的材質座標 (x, y)
 
-        # 雙相機 YOLO 推論引擎（cam0=D435I, cam1=D405）
-        from src.auto_grasp import MODEL_PATH
-        self._yolo = YoloEngine(MODEL_PATH, cam_ids=[0, 1], fps=10.0)
-        self._yolo.start(self._rs)
-
         # 自動夾取（右臂，domain_id=1）
+        # _head_detector / _hand_detector 在 AutoGrasp 內部初始化
         self._auto_grasp = AutoGrasp(
             arm_ctrl=self._arms["R"],
             domain_id=1,
-            yolo_engine=self._yolo,
         )
         self._auto_grasp.set_realsense(self._rs)
 
@@ -130,7 +179,7 @@ class App:
     def cleanup(self) -> None:
         """關閉視窗時釋放所有資源。"""
         self._logger.log("[INFO] 程式關閉，釋放所有資源...")
-        self._yolo.stop()
+        # YOLO 偵測器由 auto_grasp.cleanup() 停止
         self._auto_grasp.cleanup()
         for arm in self._arms.values():
             arm.cleanup()
@@ -909,9 +958,12 @@ class App:
         if cam_idx == 0 and stream == "RGB":
             self._handle_roi_drag()
 
-        # RGB 模式：優先顯示 YOLO overlay（cam0 和 cam1 都支援）
-        if stream == "RGB" and self._yolo.is_loaded:
-            overlay = self._yolo.get_overlay_tex(cam_idx)
+        # RGB 模式：優先顯示 YOLO overlay
+        if stream == "RGB":
+            if cam_idx == 0:
+                overlay = self._auto_grasp._head_detector.get_overlay_tex()
+            else:
+                overlay = self._auto_grasp._hand_detector.get_overlay_tex()
             if overlay is not None:
                 dpg.set_value("cam_texture", overlay)
                 return
@@ -946,13 +998,13 @@ class App:
         if self._roi_mode:
             dpg.configure_item("btn_roi_set",
                                label="⬛ 取消設定（拖移中...）")
-            self._yolo.clear_preview_roi(0)
+            self._auto_grasp._head_detector.clear_preview_roi()
         else:
             dpg.configure_item("btn_roi_set", label="✏ 拖移設定 ROI")
-            self._yolo.clear_preview_roi(0)
+            self._auto_grasp._head_detector.clear_preview_roi()
 
     def _on_roi_clear(self) -> None:
-        self._yolo.clear_roi(0)
+        self._auto_grasp._head_detector.clear_roi()
         self._roi_mode      = False
         self._roi_dragging  = False
         self._roi_press_tex = None
@@ -960,7 +1012,7 @@ class App:
         self._refresh_roi_label()
 
     def _refresh_roi_label(self) -> None:
-        roi = self._yolo.get_roi(0) if self._yolo else None
+        roi = self._auto_grasp._head_detector.get_roi()
         if dpg.does_item_exist("roi_coord_lbl"):
             if roi:
                 x1, y1, x2, y2 = roi
@@ -993,7 +1045,7 @@ class App:
             if self._roi_press_tex and self._roi_drag_tex:
                 x1, y1 = self._roi_press_tex
                 x2, y2 = self._roi_drag_tex
-                self._yolo.set_preview_roi(0, x1, y1, x2, y2)
+                self._auto_grasp._head_detector.set_preview_roi(x1, y1, x2, y2)
 
         elif self._roi_dragging and not lmb_down:
             # 放開：提交 ROI
@@ -1002,9 +1054,9 @@ class App:
                 x1, y1 = self._roi_press_tex
                 x2, y2 = self._roi_drag_tex
                 if abs(x2 - x1) > 10 and abs(y2 - y1) > 10:
-                    self._yolo.set_roi(0, x1, y1, x2, y2)
+                    self._auto_grasp._head_detector.set_roi(x1, y1, x2, y2)
                     self._refresh_roi_label()
-            self._yolo.clear_preview_roi(0)
+            self._auto_grasp._head_detector.clear_preview_roi()
             self._roi_press_tex = None
             self._roi_drag_tex  = None
             self._roi_mode = False

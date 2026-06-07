@@ -62,7 +62,8 @@ class TargetConsiderGripper:
         pos_base_mm 或 yaw_deg 為 None 時回傳 None。
         """
         pos = instrument.get('pos_base_mm')
-        yaw = instrument.get('yaw_deg')
+        # Flange2Base 輸出 yaw_base_deg；兼容舊版 yaw_deg
+        yaw = instrument.get('yaw_base_deg') or instrument.get('yaw_deg')
 
         if pos is None or yaw is None:
             return None

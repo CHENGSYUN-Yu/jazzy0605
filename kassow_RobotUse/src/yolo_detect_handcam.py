@@ -476,4 +476,4 @@ class YoloDetectHandcam:
 
     @property
     def infer_imgsz(self) -> int:
-        return self._infer_imgsz
+        return self._server_hw[0] if self._server_hw else _DEFAULT_IMGSZ

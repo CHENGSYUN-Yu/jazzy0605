@@ -51,9 +51,11 @@ class _Camera:
 
         self._color_arr: np.ndarray | None = None
         self._ir_arr:    np.ndarray | None = None
-        self._depth_arr: np.ndarray | None = None  # uint16, mm
+        self._depth_arr: np.ndarray | None = None  # float32, mm（已對齊至 color，已套 depth_scale）
         self._color_tex: np.ndarray | None = None
         self._ir_tex:    np.ndarray | None = None
+        self._align          = None    # rs.align，connect() 後建立
+        self._depth_scale_mm = 1.0     # mm per raw unit（從感測器讀取）
 
         # 相機內參（連線後從 pipeline profile 讀取）
         self.intrinsics: 'dict|None' = None   # {'fx','fy','cx','cy','w','h'}
@@ -91,6 +93,17 @@ class _Camera:
                 continue
 
         self._stop_event.clear()
+
+        # 建立 depth-to-color 對齊器
+        self._align = rs.align(rs.stream.color)
+
+        # 從感測器讀取 depth_scale（每個 raw unit 對應幾 mm）
+        try:
+            depth_sensor = self._profile.get_device().first_depth_sensor()
+            self._depth_scale_mm = depth_sensor.get_depth_scale() * 1000.0
+            logger.info(f"[{self.serial}] depth_scale={self._depth_scale_mm:.4f} mm/unit")
+        except Exception as e:
+            logger.warning(f"[{self.serial}] 讀取 depth_scale 失敗，使用預設 1.0 mm/unit：{e}")
 
         # 讀取彩色相機內參
         try:
@@ -153,14 +166,20 @@ class _Camera:
 
         while not self._stop_event.is_set():
             try:
-                frames      = self._pipeline.wait_for_frames(timeout_ms=200)
-                color_frame = frames.get_color_frame()
-                depth_frame = frames.get_depth_frame()
-                ir_frame    = frames.get_infrared_frame(1) if getattr(self, '_has_ir', False) else None
+                frames         = self._pipeline.wait_for_frames(timeout_ms=200)
+                aligned_frames = self._align.process(frames)   # depth 對齊到 color
+                color_frame    = aligned_frames.get_color_frame()
+                depth_frame    = aligned_frames.get_depth_frame()
+                ir_frame       = frames.get_infrared_frame(1) if getattr(self, '_has_ir', False) else None
 
                 color_arr = np.asanyarray(color_frame.get_data()) if color_frame else None
                 ir_arr    = np.asanyarray(ir_frame.get_data())    if ir_frame    else None
-                depth_arr = np.asanyarray(depth_frame.get_data()) if depth_frame else None
+                # depth：套用 depth_scale 轉換為 mm（D405=×0.1, D435I=×1.0）
+                if depth_frame:
+                    depth_arr = np.asanyarray(depth_frame.get_data()).astype(np.float32) \
+                                * self._depth_scale_mm
+                else:
+                    depth_arr = None
                 color_tex = RealSense._to_texture(color_arr, is_ir=False) if color_arr is not None else None
                 ir_tex    = RealSense._to_texture(ir_arr,    is_ir=True)  if ir_arr    is not None else None
 
