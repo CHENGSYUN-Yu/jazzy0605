@@ -39,6 +39,7 @@ from src.pixel2headcam       import Pixel2HeadCam
 from src.headcam2base        import HeadCam2Base
 from src.angle2rz            import Angle2Rz
 from src.pose_offset         import PoseOffset
+from src.handcam_angle2yaw   import HandcamAngle2Yaw
 from src.yolo_engine         import YoloEngine
 from src.yolo_detect_handcam import YoloDetectHandcam   # 備用
 from src.get_depth_handcam   import GetDepthHandcam
@@ -86,7 +87,7 @@ _PHASE_COLORS = {
     'opening_gripper': (255, 180, 0),
 }
 
-GRASP_Z_LIMIT_MM = -394.0
+GRASP_Z_LIMIT_MM = -472.0   # 395mm 桌面 + 75mm 器械深度 + 2mm 緩衝
 
 
 class AutoGrasp:
@@ -110,6 +111,9 @@ class AutoGrasp:
 
         # ── 目標位姿硬性補償（套用在 Cam2Flange 之前）────────────────────────
         self._pose_offset = PoseOffset(dx=25.0)   # 手部相機接近點 x +25mm
+
+        # ── 手腕相機 yaw 轉換（2D 傾角 → 法蘭目標 yaw）─────────────────────
+        self._handcam_a2y   = HandcamAngle2Yaw(offset_deg=-135.0)
 
         # ── 手腕相機物件鏈 ────────────────────────────────────────────────────
         self._handcam_det   = YoloDetectHandcam(model_path=MODEL_PATH)
@@ -145,7 +149,7 @@ class AutoGrasp:
         self._which_first   = WhichFirst()
         self._tz_compute    = TargetZCompute(z_offset_mm=300.0)
         self._c2f           = Cam2Flange()
-        self._tcg           = TargetConsiderGripper(gripper_length_mm=120.0)
+        self._tcg           = TargetConsiderGripper(gripper_length_mm=75.0)
         self._mem           = MemoryInstrumentPoint()
         self._put_site      = PutSiteGet()
         self._place_seq     = PlaceSequenceTargets(lift_z_mm=200.0)
@@ -208,6 +212,9 @@ class AutoGrasp:
 
     def _on_yaw_offset_change(self, sender, app_data) -> None:
         self._yaw_offset_deg = float(app_data)
+
+    def _on_handcam_yaw_offset_change(self, sender, app_data) -> None:
+        self._handcam_a2y.set_offset(float(app_data))
 
     # ═════════════════════════════════════════════════════════════════════════
     # YOLO 結果讀取（從 YoloEngine）
@@ -402,8 +409,8 @@ class AutoGrasp:
             )
             dpg.add_spacer(height=6)
 
-            # ── Yaw offset 滑桿 ──────────────────────────────────────────────
-            dpg.add_text('Yaw Offset（相機角→法蘭 Rz 偏移）：',
+            # ── Yaw offset 滑桿（頭部相機）───────────────────────────────────
+            dpg.add_text('Yaw Offset 頭部相機（2D角→法蘭 Rz）：',
                          color=(180, 180, 180))
             dpg.add_slider_float(
                 tag='ag_yaw_offset',
@@ -411,6 +418,18 @@ class AutoGrasp:
                 min_value=-180.0, max_value=180.0,
                 width=iw, format='%.1f°',
                 callback=self._on_yaw_offset_change,
+            )
+            dpg.add_spacer(height=4)
+
+            # ── Yaw offset 滑桿（手腕相機）───────────────────────────────────
+            dpg.add_text('Yaw Offset 手腕相機（2D角→法蘭 Rz）：',
+                         color=(180, 180, 180))
+            dpg.add_slider_float(
+                tag='ag_handcam_yaw_offset',
+                default_value=-135.0,
+                min_value=-180.0, max_value=180.0,
+                width=iw, format='%.1f°',
+                callback=self._on_handcam_yaw_offset_change,
             )
             dpg.add_spacer(height=4)
 
@@ -693,9 +712,19 @@ class AutoGrasp:
             ).start()
         else:
             # ── jog P-control 模式 ───────────────────────────────────────────
+            current_yaw = rot[2] if rot else 0.0
             start = {'x_mm': pos[0], 'y_mm': pos[1], 'z_mm': pos[2],
-                     'yaw_deg': rot[2] if rot else 0.0}
-            info = self._traj_plan.plan(start, self._auto_target)
+                     'yaw_deg': current_yaw}
+            # 依階段決定目標 yaw
+            if phase == 'moving_approach':
+                target_yaw = current_yaw          # 前半段：不旋轉
+            elif phase == 'moving_grasp':
+                target_yaw = self._auto_target.get('yaw_deg', current_yaw)  # 手腕相機 Rz
+            else:  # moving_sequence（放置 / 回 Home）
+                target_yaw = -135.0
+            target_for_plan = dict(self._auto_target)
+            target_for_plan['yaw_deg'] = target_yaw
+            info = self._traj_plan.plan(start, target_for_plan)
             self._exec_motion.start()
             self._check_arrive.reset()
             self._auto_t0 = time.monotonic()
@@ -720,7 +749,12 @@ class AutoGrasp:
 
         node = get_ros2_node(self._domain_id)
         pos = [target['x_mm'], target['y_mm'], target['z_mm']]
-        rot = [0.0, 0.0, 0.0]  # 暫時停用 Rz
+        if self._phase == 'moving_approach':
+            rot = [0.0, 0.0, 0.0]
+        elif self._phase == 'moving_grasp':
+            rot = [0.0, 0.0, target['yaw_deg']]
+        else:  # moving_sequence
+            rot = [0.0, 0.0, -135.0]
         self._log(f'MoveLinear 發送中... pos={[round(v,1) for v in pos]} yaw={rot[2]:.1f}°')
         ok  = node.call_move_linear(pos, rot, speed_mm_s=speed, ref=1,
                                     timeout_sec=60.0)
@@ -813,9 +847,17 @@ class AutoGrasp:
             det['depth_mm'] = self._handcam_depth.get_depth(det['center'], depth)
         dets = self._p2h.project_all(dets)       # → pos_cam_mm
         dets = self._h2f.transform_all(dets)     # → pos_flange_mm
-        dets = self._a2rz_h.convert_all(dets)    # → yaw_deg, Rz（法蘭座標系）
+        dets = self._a2rz_h.convert_all(dets)    # → yaw_deg, Rz（法蘭座標系，保留備用）
         dets = self._f2b.transform_all(dets)     # → pos_base_mm, yaw_base_deg
         dets = [d for d in dets if d.get('pos_base_mm')]
+
+        # ── HandcamAngle2Yaw：2D 傾角直接轉法蘭 yaw（覆蓋 T_matrix 結果）──
+        current_yaw = self._arm.current_rot[2] if self._arm and self._arm.current_rot else 0.0
+        dets = self._handcam_a2y.convert_all(dets, current_yaw=current_yaw)
+        # convert_all 輸出 yaw_deg，同步寫入 yaw_base_deg（TargetConsiderGripper 使用）
+        for det in dets:
+            det['yaw_base_deg'] = det.get('yaw_deg')
+
         self._handcam_dets = dets
 
         if not dets:
@@ -986,7 +1028,9 @@ class AutoGrasp:
 
             t   = time.monotonic() - self._auto_t0
             cmd = self._exec_motion.compute(t, pos, rot, self._traj_plan)
-            node.publish_jog(cmd['vel'], [0.0, 0.0, 0.0])  # 暫時停用 Rz
+            # moving_approach：不旋轉；moving_grasp / moving_sequence：使用計算出的 Rz
+            rot_cmd = [0.0, 0.0, 0.0] if self._phase == 'moving_approach' else cmd['rot']
+            node.publish_jog(cmd['vel'], rot_cmd)
 
             if cmd['done']:
                 arrived = self._check_arrive.update(pos, rot, time.monotonic())
