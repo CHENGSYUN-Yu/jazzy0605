@@ -87,7 +87,8 @@ _PHASE_COLORS = {
     'opening_gripper': (255, 180, 0),
 }
 
-GRASP_Z_LIMIT_MM = -472.0   # 395mm 桌面 + 75mm 器械深度 + 2mm 緩衝
+_TABLE_Z_ABS_MM = 395.0   # 桌面距機器人基座的絕對距離（mm）
+_Z_BUFFER_MM    = 2.0     # 安全緩衝（mm）
 
 
 class AutoGrasp:
@@ -149,7 +150,7 @@ class AutoGrasp:
         self._which_first   = WhichFirst()
         self._tz_compute    = TargetZCompute(z_offset_mm=300.0)
         self._c2f           = Cam2Flange()
-        self._tcg           = TargetConsiderGripper(gripper_length_mm=75.0)
+        self._tcg           = TargetConsiderGripper(gripper_length_mm=77.0)
         self._mem           = MemoryInstrumentPoint()
         self._put_site      = PutSiteGet()
         self._place_seq     = PlaceSequenceTargets(lift_z_mm=200.0)
@@ -172,8 +173,9 @@ class AutoGrasp:
         self._auto_target      = None
         self._auto_put_site    = None
         self._auto_t0          = 0.0
-        self._move_queue:  list = []
-        self._move_on_arrived  = None
+        self._move_queue:     list = []
+        self._move_on_arrived     = None
+        self._sequence_done_cb    = None   # 序列全部完成後的 callback（獨立於每步 _move_on_arrived）
         self._current_dets:list = []
 
         # ── 手腕相機（Phase 2，暫存 stub）─────────────────────────────────────
@@ -196,7 +198,15 @@ class AutoGrasp:
         self._last_infer_t = 0.0
         self._rs = None
         self._yaw_offset_deg = -45.0
-        self._use_move_linear = False   # True = MoveLinear 服務；False = jog P-control
+        self._use_move_linear = True    # True = MoveLinear 服務（預設）；False = jog P-control
+
+    @property
+    def _grasp_z_limit(self) -> float:
+        """夾取 Z 安全下限（動態，隨夾爪補償長度變化）。"""
+        return -(_TABLE_Z_ABS_MM + self._tcg.gripper_length_mm + _Z_BUFFER_MM)
+
+    def _on_gripper_length_change(self, sender, app_data) -> None:
+        self._tcg.set_gripper_length(float(app_data))
 
     def set_realsense(self, rs) -> None:
         """由 app 注入 RealSense 物件，同時啟動兩個 YOLO 偵測器。"""
@@ -355,16 +365,16 @@ class AutoGrasp:
                                callback=self._on_stop, width=100)
             dpg.add_spacer(height=6)
             dpg.add_checkbox(
-                label='使用 MoveLinear 服務（AUTONOMOUS 模式）',
+                label='改用 Jog P-control（取消勾選 = MoveLinear 預設）',
                 tag='ag_use_move_linear',
                 default_value=False,
-                callback=lambda s, v: setattr(self, '_use_move_linear', v),
+                callback=lambda s, v: setattr(self, '_use_move_linear', not v),
             )
             dpg.add_spacer(height=4)
             dpg.add_text('MoveLinear 速度 (mm/s)：', color=(180, 180, 180))
             dpg.add_slider_float(
                 tag='ag_move_speed',
-                default_value=50.0,
+                default_value=130.0,
                 min_value=5.0, max_value=200.0,
                 width=iw, format='%.0f mm/s',
             )
@@ -430,6 +440,17 @@ class AutoGrasp:
                 min_value=-180.0, max_value=180.0,
                 width=iw, format='%.1f°',
                 callback=self._on_handcam_yaw_offset_change,
+            )
+            dpg.add_spacer(height=4)
+
+            # ── 夾爪補償長度 ──────────────────────────────────────────────────
+            dpg.add_text('夾爪補償長度（法蘭到指尖 mm）：', color=(180, 180, 180))
+            dpg.add_slider_float(
+                tag='ag_gripper_length',
+                default_value=self._tcg.gripper_length_mm,
+                min_value=50.0, max_value=150.0,
+                width=iw, format='%.0f mm',
+                callback=self._on_gripper_length_change,
             )
             dpg.add_spacer(height=4)
 
@@ -736,28 +757,36 @@ class AutoGrasp:
 
     def _run_move_linear(self, target: dict, speed: float, on_arrived_cb) -> None:
         """在 background thread 呼叫 MoveLinear 服務，完成後執行 callback。"""
-        # 先確認機器人在 AUTONOMOUS 模式
-        if self._arm and self._arm.current_rot is not None:
-            pass  # arm state available
-        # 從最新系統狀態取 robot_mode（透過 arm_controller 的 apply_state 儲存）
-        robot_mode = getattr(self._arm, '_last_robot_mode', None) if self._arm else None
-        if robot_mode == 0:   # MANUAL
-            self._set_phase('stopped',
-                '❌ MoveLinear 需要 AUTONOMOUS 模式\n'
-                '請在教導盒切換到自動模式後再試')
+        node = get_ros2_node(self._domain_id)
+
+        # 切換到 AUTONOMOUS 模式（關閉 interactivity）
+        self._log('切換到 AUTONOMOUS 模式...')
+        if not node.call_set_interactivity(enable=False):
+            self._set_phase('stopped', '❌ 無法切換到 AUTONOMOUS 模式\n請確認 ROS2 driver 連線正常')
             return
 
-        node = get_ros2_node(self._domain_id)
         pos = [target['x_mm'], target['y_mm'], target['z_mm']]
+        # MoveLinear 的 rot 是絕對目標姿態（不是速度指令）
+        # 必須帶入當前 R、P，只修改需要改變的 Yaw
+        cur = list(self._arm.current_rot) if self._arm and self._arm.current_rot else [0.0, 0.0, 0.0]
         if self._phase == 'moving_approach':
-            rot = [0.0, 0.0, 0.0]
+            rot = cur                                       # 保持完整當前姿態，只移 XYZ
         elif self._phase == 'moving_grasp':
-            rot = [0.0, 0.0, target['yaw_deg']]
+            rot = [cur[0], cur[1], target['yaw_deg']]      # 保持 R/P，設定夾取 Yaw
         else:  # moving_sequence
-            rot = [0.0, 0.0, -135.0]
+            rot = [cur[0], cur[1], -135.0]                 # 保持 R/P，固定放置 Yaw
         self._log(f'MoveLinear 發送中... pos={[round(v,1) for v in pos]} yaw={rot[2]:.1f}°')
-        ok  = node.call_move_linear(pos, rot, speed_mm_s=speed, ref=1,
-                                    timeout_sec=60.0)
+        try:
+            # sync = 當前 joint 4 角度，固定 null-space 避免持續旋轉
+            joints = getattr(self._arm, 'current_joints', [])
+            sync = float(joints[3]) if len(joints) >= 4 else 78.0
+            ok = node.call_move_linear(pos, rot, speed_mm_s=speed, ref=0,
+                                       sync=sync, timeout_sec=60.0)
+        finally:
+            # 無論成功或失敗都恢復 MANUAL 模式，確保安全
+            node.call_set_interactivity(enable=True)
+            self._log('已恢復 MANUAL 模式')
+
         if ok:
             self._log('✅ MoveLinear success')
             cb = self._move_on_arrived
@@ -768,19 +797,21 @@ class AutoGrasp:
             self._set_phase('stopped',
                 '❌ MoveLinear 失敗\n'
                 '可能原因：\n'
-                '  1. 機器人不在 AUTONOMOUS 模式\n'
-                '  2. 目標位置超出工作範圍\n'
-                '  3. 路徑上有碰撞')
+                '  1. 目標位置超出工作範圍\n'
+                '  2. 路徑上有碰撞\n'
+                '  3. 機器人處於 ALARM 或 SUSPENDED 狀態')
 
     def _step_start_sequence(self, targets: list, on_done_cb) -> None:
-        self._move_queue = list(targets)
-        self._move_on_arrived = on_done_cb
+        self._move_queue       = list(targets)
+        self._sequence_done_cb = on_done_cb   # 保存在獨立欄位，不被 _step_start_moving 覆蓋
         self._step_next_in_sequence()
 
     def _step_next_in_sequence(self) -> None:
         if not self._move_queue:
-            if self._move_on_arrived:
-                self._move_on_arrived()
+            cb = self._sequence_done_cb
+            self._sequence_done_cb = None
+            if cb:
+                cb()
             return
         self._auto_target = self._move_queue.pop(0)
         self._step_start_moving('moving_sequence', self._step_next_in_sequence)
@@ -840,19 +871,31 @@ class AutoGrasp:
         if pos and rot:
             self._f2b.update_arm_pose(pos, rot)
 
+        # Flange2Base 需要手臂即時位姿，先確認就緒
+        if not self._f2b.is_ready:
+            self._log('[手腕相機] 等待手臂位姿更新...')
+            return
+
         # 座標轉換鏈
         import copy
         dets = copy.deepcopy(stable_dets)
         for det in dets:
             det['depth_mm'] = self._handcam_depth.get_depth(det['center'], depth)
-        dets = self._p2h.project_all(dets)       # → pos_cam_mm
-        dets = self._h2f.transform_all(dets)     # → pos_flange_mm
-        dets = self._a2rz_h.convert_all(dets)    # → yaw_deg, Rz（法蘭座標系，保留備用）
-        dets = self._f2b.transform_all(dets)     # → pos_base_mm, yaw_base_deg
+        print(f'[DBG] depth_mm={[d.get("depth_mm") for d in dets]}  p2h.is_ready={self._p2h.is_ready}  h2f.is_ready={self._h2f.is_ready}  f2b.is_ready={self._f2b.is_ready}')
+        dets = self._p2h.project_all(dets)
+        print(f'[DBG] after p2h: pos_cam_mm={[d.get("pos_cam_mm") for d in dets]}')
+        dets = self._h2f.transform_all(dets)
+        print(f'[DBG] after h2f: pos_flange_mm={[d.get("pos_flange_mm") for d in dets]}')
+        dets = self._a2rz_h.convert_all(dets)
+        dets = self._f2b.transform_all(dets)
+        print(f'[DBG] after f2b: pos_base_mm={[d.get("pos_base_mm") for d in dets]}')
         dets = [d for d in dets if d.get('pos_base_mm')]
 
         # ── HandcamAngle2Yaw：2D 傾角直接轉法蘭 yaw（覆蓋 T_matrix 結果）──
         current_yaw = self._arm.current_rot[2] if self._arm and self._arm.current_rot else 0.0
+        # 先儲存 T_matrix 計算的 yaw（用於診斷比對）
+        for det in dets:
+            det['yaw_base_tmatrix'] = det.get('yaw_base_deg')
         dets = self._handcam_a2y.convert_all(dets, current_yaw=current_yaw)
         # convert_all 輸出 yaw_deg，同步寫入 yaw_base_deg（TargetConsiderGripper 使用）
         for det in dets:
@@ -867,13 +910,22 @@ class AutoGrasp:
         first = self._which_first_h.get_first(dets)
         if first:
             self._handcam_selected = first
-            pos_b = first.get('pos_base_mm', [0, 0, 0])
+            pos_b      = first.get('pos_base_mm', [0, 0, 0])
+            raw_angle  = first.get('angle_deg', 0.0)
+            yaw_offset = self._handcam_a2y.offset_deg
+            yaw_final  = first.get('yaw_base_deg') or 0.0
+            yaw_tmat   = first.get('yaw_base_tmatrix')
             txt = (
                 f'手腕相機偵測結果（YoloEngine cam1）：\n'
-                f'  conf     = {first["conf"]:.2f}\n'
-                f'  depth    = {first.get("depth_mm", 0):.0f} mm\n'
-                f'  pos_base = {[round(v, 1) for v in pos_b]}\n'
-                f'  yaw      = {round(first.get("yaw_base_deg") or 0, 1)}°\n\n'
+                f'  conf          = {first["conf"]:.2f}\n'
+                f'  depth         = {first.get("depth_mm", 0):.0f} mm\n'
+                f'  pos_base      = {[round(v, 1) for v in pos_b]}\n'
+                f'\n'
+                f'  ★ 2D 傾角（fitEllipse） = {round(raw_angle, 1)}°\n'
+                f'  ★ HandcamAngle2Yaw     = -({round(raw_angle, 1)}°) + offset({yaw_offset:+.1f}°) → {round(yaw_final, 1)}°\n'
+                f'  ★ T_matrix Rz          = {round(yaw_tmat, 1) if yaw_tmat is not None else "N/A"}°\n'
+                f'\n'
+                f'請手動對齊後記錄實際 Rz，比對上方 2D 傾角\n'
                 f'按「確認繼續」計算夾取位姿'
             )
             self._set_phase('confirm_handcam', txt)
@@ -887,7 +939,7 @@ class AutoGrasp:
         if grasp_target is None:
             self._set_phase('stopped', '❌ TargetConsiderGripper 失敗')
             return
-        if grasp_target['z_mm'] < GRASP_Z_LIMIT_MM:
+        if grasp_target['z_mm'] < self._grasp_z_limit:
             self._set_phase('detecting',
                 f'⚠ 目標 z={grasp_target["z_mm"]:.1f}mm 低於安全下限'
                 f'（{GRASP_Z_LIMIT_MM}mm），返回偵測')
@@ -988,8 +1040,21 @@ class AutoGrasp:
             self._set_phase('complete', f'✅ 已完成 {count} 個器械夾取！')
         else:
             self._log(f'已完成 {count}/3，回到偵測繼續下一個')
-            threading.Thread(target=self._stub_detecting, daemon=True).start()
-            self._set_phase('detecting', '等待下一個偵測結果...')
+            yolo_ready = (self._head_detector.is_loaded and
+                          self._hand_detector.is_loaded)
+            rs_ready   = (self._rs is not None)
+            if yolo_ready and rs_ready:
+                self._set_phase('detecting',
+                    '🔍 YOLO 偵測中，等待穩定目標...\n'
+                    '（偵測到目標後會自動進入確認階段）')
+                # tick() 會呼叫 _try_inject_detection() 觸發
+            else:
+                reason = []
+                if not yolo_ready: reason.append('YOLO 未就緒')
+                if not rs_ready:   reason.append('相機未連線')
+                threading.Thread(target=self._stub_detecting, daemon=True).start()
+                self._set_phase('detecting',
+                    f'⚠ Stub 模式（{", ".join(reason)}）\n等待手臂位置...')
 
     def _setup_gripper(self) -> None:
         node = get_ros2_node(self._domain_id)

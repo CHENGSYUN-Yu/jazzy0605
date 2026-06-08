@@ -6,17 +6,18 @@ handcam_angle2yaw.py — 手腕相機 2D 傾角 → 夾爪目標 yaw（獨立工
     直接轉換為夾爪（法蘭面）需要到達的目標偏航角（yaw_deg）。
 
     不使用 T_matrix，適用於手腕相機已知幾何關係的簡化補償：
-        angle_deg=  0° → yaw_deg= -45°
-        angle_deg= 90° → yaw_deg=-135°
-        公式：yaw = angle + offset（預設 offset=-45°）
+        公式：yaw = -angle_deg + offset（注意是負號，fitEllipse 座標與 Rz 方向相反）
+        angle_deg=  0° → raw = -135°，選優解 -135° 或 45°
+        angle_deg= 90° → raw =  135°，選優解 -45°  或 135°
 
     支援 180° 對稱選優解（夾爪雙向可夾），選與當前 TCP yaw 最近的解。
 
 外部使用方式：
-    h2y = HandcamAngle2Yaw(offset_deg=-45.0)
-    yaw = h2y.convert(angle_deg=90.0, current_yaw=0.0)    # → -135.0°
-    dets = h2y.convert_all(dets, current_yaw=tcp_yaw)      # 批次，新增 yaw_deg 欄位
-    h2y.set_offset(-45.0)
+    h2y = HandcamAngle2Yaw(offset_deg=-135.0)
+    yaw = h2y.convert(angle_deg=5.8,   current_yaw=-135.0)  # → -140.8°
+    yaw = h2y.convert(angle_deg=134.5, current_yaw=-90.0)   # →  -89.5°
+    dets = h2y.convert_all(dets, current_yaw=tcp_yaw)       # 批次，新增 yaw_deg 欄位
+    h2y.set_offset(-135.0)
 """
 
 import copy
@@ -65,7 +66,7 @@ class HandcamAngle2Yaw:
 
         回傳：夾爪目標 yaw_deg（度）
         """
-        raw = _normalize(float(angle_deg) + self._offset)
+        raw = _normalize(-float(angle_deg) + self._offset)
         # 180° 對稱解：選與當前 TCP yaw 差距最小的
         alt = raw + 180.0 if raw <= 0.0 else raw - 180.0
         return raw if abs(raw - current_yaw) <= abs(alt - current_yaw) else alt

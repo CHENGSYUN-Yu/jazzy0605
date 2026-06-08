@@ -42,21 +42,33 @@ _DEFAULT_CONF = {0: 0.15, 1: 0.50}
 # ── EMA bbox 平滑器 ───────────────────────────────────────────────────────────
 
 class _BoxSmoother:
-    """IoU 追蹤 + EMA 平滑 + 穩定幀數確認。"""
+    """IoU 追蹤 + EMA 平滑 + 穩定幀數確認 + 滑行幀（coast）。"""
 
     def __init__(self, alpha: float = 0.12, iou_thresh: float = 0.25,
-                 confirm_frames: int = 3):
+                 confirm_frames: int = 3, coast_frames: int = 3):
         self._alpha          = alpha
         self._iou_thresh     = iou_thresh
         self._confirm_frames = confirm_frames
+        self._coast_frames   = coast_frames   # YOLO 沒輸出時最多保留幾幀
         self._prev: list     = []
         self._consec: list   = []
+        self._coast_left: int = 0             # 當前剩餘滑行幀數
 
     def smooth(self, dets: list) -> list:
         if not dets:
+            if self._coast_left > 0 and self._prev:
+                # 滑行：保留上一幀的 bbox，但標記 stable=False
+                self._coast_left -= 1
+                coasted = copy.deepcopy(self._prev)
+                for d in coasted:
+                    d['stable'] = False
+                return coasted
+            # 滑行耗盡，真正清空
             self._prev = []
             self._consec = []
+            self._coast_left = 0
             return dets
+        self._coast_left = self._coast_frames  # 偵測到了，重置滑行計數
         if not self._prev:
             self._prev   = [copy.deepcopy(d) for d in dets]
             self._consec = [1] * len(dets)
@@ -106,8 +118,9 @@ class _BoxSmoother:
         return result
 
     def reset(self) -> None:
-        self._prev   = []
-        self._consec = []
+        self._prev       = []
+        self._consec     = []
+        self._coast_left = 0
 
 
 def _copy_det(d: dict) -> dict:

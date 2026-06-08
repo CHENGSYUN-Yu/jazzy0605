@@ -56,13 +56,17 @@ class _KassowNode:
         self._node = Node('kassow_auto_grasp_node')
         self._pub  = self._node.create_publisher(
             JogLinear, '/kr/motion/jog_linear', 10)
+        from kr_msgs.srv import SetInteractivity
         self._cli_gripper = self._node.create_client(
-            SetDiscreteOutput, '/kr/iob/set_discrete_output')
+            SetDiscreteOutput, '/kr/iob/set_digital_output')
         self._cli_move = self._node.create_client(
             MoveLinear, '/kr/motion/move_linear')
+        self._cli_interactivity = self._node.create_client(
+            SetInteractivity, '/kr/motion/set_interactivity')
         self._JogLinear = JogLinear
         self._SetDiscreteOutput = SetDiscreteOutput
         self._MoveLinear = MoveLinear
+        self._SetInteractivity = SetInteractivity
         self._lock = threading.Lock()
 
     # rclpy.spin 需要存取底層 node
@@ -82,7 +86,8 @@ class _KassowNode:
                          pos: list,
                          rot: list,
                          speed_mm_s: float = 50.0,
-                         ref: int = 1,
+                         ref: int = 0,
+                         sync: float = 78.0,
                          timeout_sec: float = 30.0) -> bool:
         """
         呼叫 /kr/motion/move_linear 服務，等待手臂到達目標後回傳結果。
@@ -93,9 +98,11 @@ class _KassowNode:
         ref       : 0=WORLD, 1=BASE, 2=TCP
         timeout_sec: 最長等待秒數（超時回傳 False）
         回傳 True = 到達目標；False = 失敗或超時
+
+        注意：不使用 spin_until_future_complete，避免與 rclpy_spin 執行緒衝突。
+              改用 threading.Event 等待 future 完成（由 spin 執行緒處理回調）。
         """
         try:
-            import rclpy
             if not self._cli_move.wait_for_service(timeout_sec=3.0):
                 print('[ros2_node] move_linear service not available')
                 return False
@@ -105,20 +112,52 @@ class _KassowNode:
             req.ref    = int(ref)
             req.ttype  = 0           # TT_VEL = 0
             req.tvalue = float(speed_mm_s)
+            print(f'[ros2_node] move_linear request: pos={[round(v,1) for v in pos]} '
+                  f'rot={[round(v,1) for v in rot]} ref={ref} speed={speed_mm_s}mm/s')
             req.bpoint = 0           # BP_STOP = 0
             req.btype  = 0           # BT_ACC = 0
-            req.bvalue = 0.0
-            req.sync   = 0.0
+            req.bvalue = 1000.0
+            req.sync   = float(sync)
             req.chaining = 0         # CH_INT = 0
+            done_event = threading.Event()
             future = self._cli_move.call_async(req)
-            rclpy.spin_until_future_complete(
-                self._node, future, timeout_sec=timeout_sec)
-            if future.done():
-                return bool(future.result().success)
-            print('[ros2_node] move_linear timeout')
-            return False
+            future.add_done_callback(lambda _f: done_event.set())
+            completed = done_event.wait(timeout=timeout_sec)
+            if not completed:
+                print('[ros2_node] move_linear timeout')
+                return False
+            result = future.result()
+            print(f'[ros2_node] move_linear response: success={result.success}  '
+                  f'(all fields: {vars(result) if hasattr(result, "__dict__") else result})')
+            return bool(result.success)
         except Exception as e:
             print(f'[ros2_node] call_move_linear failed: {e}')
+            return False
+
+    def call_set_interactivity(self, enable: bool) -> bool:
+        """
+        切換機器人模式。
+        enable=False → AUTONOMOUS（可執行 MoveLinear）
+        enable=True  → MANUAL（可執行 JogLinear，恢復手動）
+        """
+        try:
+            if not self._cli_interactivity.wait_for_service(timeout_sec=3.0):
+                print('[ros2_node] set_interactivity service not available')
+                return False
+            req = self._SetInteractivity.Request()
+            req.enable = bool(enable)
+            done_event = threading.Event()
+            future = self._cli_interactivity.call_async(req)
+            future.add_done_callback(lambda _f: done_event.set())
+            if not done_event.wait(timeout=5.0):
+                print('[ros2_node] set_interactivity timeout')
+                return False
+            result = future.result()
+            mode = 'MANUAL' if enable else 'AUTONOMOUS'
+            print(f'[ros2_node] set_interactivity({mode}) → success={result.success}')
+            return bool(result.success)
+        except Exception as e:
+            print(f'[ros2_node] call_set_interactivity failed: {e}')
             return False
 
     def call_gripper_io(self, index: int, value: int) -> bool:
@@ -128,13 +167,15 @@ class _KassowNode:
                 return False
             req = self._SetDiscreteOutput.Request()
             req.index = int(index)
-            req.value = bool(value)
-            import rclpy
+            req.value = int(value)
+            print(f'[ros2_node] gripper IO index={index} value={value}')
+            done_event = threading.Event()
             future = self._cli_gripper.call_async(req)
-            rclpy.spin_until_future_complete(self._node, future, timeout_sec=3.0)
-            if future.done():
-                return bool(future.result().success)
-            return False
+            future.add_done_callback(lambda _f: done_event.set())
+            completed = done_event.wait(timeout=3.0)
+            if not completed:
+                return False
+            return bool(future.result().success)
         except Exception as e:
             print(f'[ros2_node] call_gripper_io failed: {e}')
             return False
