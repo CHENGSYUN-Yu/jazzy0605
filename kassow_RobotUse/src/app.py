@@ -142,11 +142,16 @@ class App:
 
         self._cart_stepping = False
 
-        # ROI 拖移狀態
-        self._roi_mode      = False   # 目前是否在 ROI 拖移模式
-        self._roi_dragging  = False   # 滑鼠正在拖移中
-        self._roi_press_tex = None    # 按下時的材質座標 (x, y)
-        self._roi_drag_tex  = None    # 目前拖移位置的材質座標 (x, y)
+        # ROI 拖移狀態（cam0 頭部相機）
+        self._roi_mode      = False
+        self._roi_dragging  = False
+        self._roi_press_tex = None
+        self._roi_drag_tex  = None
+        # ROI 拖移狀態（cam1 手腕相機）
+        self._roi1_mode      = False
+        self._roi1_dragging  = False
+        self._roi1_press_tex = None
+        self._roi1_drag_tex  = None
 
         # 自動夾取（右臂，domain_id=1）
         # _head_detector / _hand_detector 在 AutoGrasp 內部初始化
@@ -352,6 +357,27 @@ class App:
             dpg.add_text("未設定", tag="roi_coord_lbl",
                          color=(150, 150, 150))
             self._refresh_roi_label()
+
+            dpg.add_spacer(height=6)
+            dpg.add_text("ROI 偵測範圍 (Cam 2 手腕相機)", color=(200, 200, 100))
+            dpg.add_spacer(height=4)
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="✏ 拖移設定 ROI",
+                    tag="btn_roi1_set",
+                    callback=self._on_roi1_toggle,
+                    width=140,
+                )
+                dpg.add_spacer(width=6)
+                dpg.add_button(
+                    label="✕ 清除 ROI",
+                    callback=self._on_roi1_clear,
+                    width=100,
+                )
+            dpg.add_spacer(height=4)
+            dpg.add_text("未設定", tag="roi1_coord_lbl",
+                         color=(150, 150, 150))
+            self._refresh_roi1_label()
 
     # =========================================================================
     # 右側：機器人控制面板
@@ -945,6 +971,7 @@ class App:
     def update_camera(self) -> None:
         self._auto_grasp.tick()
         self._refresh_roi_label()
+        self._refresh_roi1_label()
 
         selected_label = dpg.get_value("cam_selector")
         stream         = dpg.get_value("stream_selector")
@@ -954,9 +981,12 @@ class App:
         except ValueError:
             cam_idx = 0
 
-        # ROI 拖移處理（只對 cam0）
-        if cam_idx == 0 and stream == "RGB":
-            self._handle_roi_drag()
+        # ROI 拖移處理
+        if stream == "RGB":
+            if cam_idx == 0:
+                self._handle_roi_drag()
+            elif cam_idx == 1:
+                self._handle_roi1_drag()
 
         # RGB 模式：優先顯示 YOLO overlay
         if stream == "RGB":
@@ -1061,6 +1091,75 @@ class App:
             self._roi_drag_tex  = None
             self._roi_mode = False
             dpg.configure_item("btn_roi_set", label="✏ 拖移設定 ROI")
+
+    # ── Cam1 手腕相機 ROI ────────────────────────────────────────────────────
+
+    def _on_roi1_toggle(self) -> None:
+        self._roi1_mode = not self._roi1_mode
+        self._roi1_dragging  = False
+        self._roi1_press_tex = None
+        self._roi1_drag_tex  = None
+        if self._roi1_mode:
+            dpg.configure_item("btn_roi1_set", label="⬛ 取消設定（拖移中...）")
+            self._auto_grasp._hand_detector.clear_preview_roi()
+        else:
+            dpg.configure_item("btn_roi1_set", label="✏ 拖移設定 ROI")
+            self._auto_grasp._hand_detector.clear_preview_roi()
+
+    def _on_roi1_clear(self) -> None:
+        self._auto_grasp._hand_detector.clear_roi()
+        self._roi1_mode      = False
+        self._roi1_dragging  = False
+        self._roi1_press_tex = None
+        dpg.configure_item("btn_roi1_set", label="✏ 拖移設定 ROI")
+        self._refresh_roi1_label()
+
+    def _refresh_roi1_label(self) -> None:
+        roi = self._auto_grasp._hand_detector.get_roi()
+        if dpg.does_item_exist("roi1_coord_lbl"):
+            if roi:
+                x1, y1, x2, y2 = roi
+                dpg.set_value("roi1_coord_lbl", f"x: {x1}–{x2}  y: {y1}–{y2}")
+                dpg.configure_item("roi1_coord_lbl", color=(80, 220, 80))
+            else:
+                dpg.set_value("roi1_coord_lbl", "未設定")
+                dpg.configure_item("roi1_coord_lbl", color=(150, 150, 150))
+
+    def _handle_roi1_drag(self) -> None:
+        """在 render loop 裡處理 cam1 ROI 滑鼠拖移。"""
+        if not self._roi1_mode:
+            return
+        if not dpg.does_item_exist("cam_image"):
+            return
+
+        hovered  = dpg.is_item_hovered("cam_image")
+        lmb_down = dpg.is_mouse_button_down(0)
+
+        if hovered and lmb_down and not self._roi1_dragging:
+            self._roi1_dragging  = True
+            self._roi1_press_tex = self._mouse_to_tex()
+            self._roi1_drag_tex  = self._roi1_press_tex
+
+        elif self._roi1_dragging and lmb_down:
+            self._roi1_drag_tex = self._mouse_to_tex()
+            if self._roi1_press_tex and self._roi1_drag_tex:
+                x1, y1 = self._roi1_press_tex
+                x2, y2 = self._roi1_drag_tex
+                self._auto_grasp._hand_detector.set_preview_roi(x1, y1, x2, y2)
+
+        elif self._roi1_dragging and not lmb_down:
+            self._roi1_dragging = False
+            if self._roi1_press_tex and self._roi1_drag_tex:
+                x1, y1 = self._roi1_press_tex
+                x2, y2 = self._roi1_drag_tex
+                if abs(x2 - x1) > 10 and abs(y2 - y1) > 10:
+                    self._auto_grasp._hand_detector.set_roi(x1, y1, x2, y2)
+                    self._refresh_roi1_label()
+            self._auto_grasp._hand_detector.clear_preview_roi()
+            self._roi1_press_tex = None
+            self._roi1_drag_tex  = None
+            self._roi1_mode = False
+            dpg.configure_item("btn_roi1_set", label="✏ 拖移設定 ROI")
 
     def _mouse_to_tex(self) -> 'tuple[int,int] | None':
         """

@@ -97,6 +97,11 @@ class _Camera:
         # 建立 depth-to-color 對齊器
         self._align = rs.align(rs.stream.color)
 
+        # 時間濾波器（減少深度幀間的隨機雜訊）
+        self._temporal_filter = rs.temporal_filter()
+        # 洞填充濾波器（填補白色/反光表面造成的 0 值區域）
+        self._hole_filling_filter = rs.hole_filling_filter()
+
         # 從感測器讀取 depth_scale（每個 raw unit 對應幾 mm）
         try:
             depth_sensor = self._profile.get_device().first_depth_sensor()
@@ -174,8 +179,10 @@ class _Camera:
 
                 color_arr = np.asanyarray(color_frame.get_data()) if color_frame else None
                 ir_arr    = np.asanyarray(ir_frame.get_data())    if ir_frame    else None
-                # depth：套用 depth_scale 轉換為 mm（D405=×0.1, D435I=×1.0）
+                # depth：時間濾波後再套用 depth_scale 轉換為 mm
                 if depth_frame:
+                    depth_frame = self._temporal_filter.process(depth_frame)
+                    depth_frame = self._hole_filling_filter.process(depth_frame)
                     depth_arr = np.asanyarray(depth_frame.get_data()).astype(np.float32) \
                                 * self._depth_scale_mm
                 else:

@@ -32,6 +32,8 @@ from src.cam2flange          import Cam2Flange
 from src.gripper_control     import GripperControl
 from src.memory_instrument_point import MemoryInstrumentPoint
 from src.put_site_get        import PutSiteGet
+from src.grasp_z_override             import GraspZOverride
+from src.restore_instrument_sequence  import RestoreInstrumentSequence
 from src.place_sequence_targets import PlaceSequenceTargets
 from src.return_home_targets import ReturnHomeTargets
 from src.depth_reader        import DepthReader
@@ -53,7 +55,22 @@ from src.ros2_node           import get_ros2_node
 _BASE = os.path.join(os.path.dirname(__file__), '..')
 MODEL_PATH    = os.path.join(_BASE, 'models', 'best20260603.pt')
 T_MATRIX_PATH = os.path.join(_BASE, 'T_matrix_20260603_head30.npy')   # 頭部相機→base
-EIH_T_PATH    = os.path.join(_BASE, 'T_cam2gripper_20260526_more14z.npy')  # 手部相機→法蘭
+EIH_T_PATH    = os.path.join(_BASE, 'T_cam2gripper_20260609_26point.npy')  # 手部相機→法蘭（暫時替換）
+
+# ── 自動模式時序常數（秒）────────────────────────────────────────────────────
+_AUTO_CONFIRM_DELAYS: dict[str, float] = {
+    'confirm_selection':     3.0,   # 頭部相機：固定等 3s（bbox 穩定）
+    'confirm_target':        0.3,
+    'confirm_arrived':       0.3,
+    'confirm_handcam':       0.3,
+    'confirm_grasp_target':  0.3,
+    'confirm_grasp_arrived': 0.3,
+    'confirm_gripper_closed': 0.3,
+    'confirm_recording':     0.3,
+    'confirm_place_arrived': 0.3,
+}
+_HANDCAM_DETECT_WAIT_S  = 5.0   # 手腕相機：到位後固定等 5s 再取結果
+_HOME_RESTORE_WAIT_S    = 2.0   # 全部放置後在 Home 等待 2s
 
 # ── 狀態標籤 ──────────────────────────────────────────────────────────────────
 _PHASE_LABELS = {
@@ -75,6 +92,8 @@ _PHASE_LABELS = {
     'confirm_place_arrived':  '⏸ 確認：已到放置位置',
     'opening_gripper':        '✋ 夾爪張開中...',
     'complete':               '✅ 完成',
+    'restoring':              '🔄 還原器械中...',
+    'restore_complete':       '✅ 器械已全數還原',
     'stopped':                '■ 已停止',
 }
 
@@ -150,9 +169,12 @@ class AutoGrasp:
         self._which_first   = WhichFirst()
         self._tz_compute    = TargetZCompute(z_offset_mm=300.0)
         self._c2f           = Cam2Flange()
-        self._tcg           = TargetConsiderGripper(gripper_length_mm=77.0)
+        self._tcg           = TargetConsiderGripper(gripper_length_mm=100.0)
         self._mem           = MemoryInstrumentPoint()
         self._put_site      = PutSiteGet()
+        self._grasp_z_ovr   = GraspZOverride(z_mm=-398.2, enabled=True)
+        self._restore_seq   = RestoreInstrumentSequence(approach_offset_mm=300.0)
+        self._restore_queue: list = []
         self._place_seq     = PlaceSequenceTargets(lift_z_mm=200.0)
         self._home_seq      = ReturnHomeTargets(lift_z_mm=200.0)
         self._traj_plan     = TrajectoryPlan()
@@ -199,6 +221,7 @@ class AutoGrasp:
         self._rs = None
         self._yaw_offset_deg = -45.0
         self._use_move_linear = True    # True = MoveLinear 服務（預設）；False = jog P-control
+        self._auto_mode = True          # True = 全自動連續執行；False = 單步手動確認
 
     @property
     def _grasp_z_limit(self) -> float:
@@ -538,6 +561,20 @@ class AutoGrasp:
             self._refresh_btn_state()
         self._ui_queue.put(_update)
 
+        # 自動模式：confirm_* 階段自動排程確認
+        if self._auto_mode and phase in _AUTO_CONFIRM_DELAYS:
+            delay = _AUTO_CONFIRM_DELAYS[phase]
+            self._schedule_auto_confirm(delay, phase)
+
+    def _schedule_auto_confirm(self, delay_s: float, expected_phase: str) -> None:
+        """等待 delay_s 秒後，若仍在 expected_phase 則自動觸發確認。"""
+        def _trigger():
+            time.sleep(delay_s)
+            if self._phase == expected_phase:
+                self._on_confirm()
+        threading.Thread(target=_trigger, daemon=True,
+                         name=f'auto_confirm_{expected_phase}').start()
+
     def _log(self, text: str) -> None:
         """附加一行 log（thread-safe）。"""
         def _update():
@@ -547,7 +584,7 @@ class AutoGrasp:
         self._ui_queue.put(_update)
 
     def _refresh_btn_state(self) -> None:
-        can_start   = self._phase in ('idle', 'stopped', 'complete')
+        can_start   = self._phase in ('idle', 'stopped', 'complete', 'restore_complete')
         can_confirm = self._phase.startswith('confirm_')
         if dpg.does_item_exist(self._tag_start):
             dpg.configure_item(self._tag_start,   enabled=can_start)
@@ -561,8 +598,8 @@ class AutoGrasp:
     def _on_start(self) -> None:
         if dpg.does_item_exist(self._tag_log):
             dpg.set_value(self._tag_log, '')
-        if hasattr(self._mem, 'reset'):
-            self._mem.reset()
+        self._mem.clear()
+        self._mem.reset_counter()
         self._log('[INFO] 自動夾取流程啟動')
 
         yolo_ready = (self._head_detector.is_loaded and self._hand_detector.is_loaded)
@@ -587,6 +624,7 @@ class AutoGrasp:
     def _on_stop(self) -> None:
         self._motion_running = False
         self._move_queue.clear()
+        self._restore_queue.clear()
         self._move_on_arrived = None
         node = get_ros2_node(self._domain_id)
         node.publish_stop()
@@ -773,6 +811,8 @@ class AutoGrasp:
             rot = cur                                       # 保持完整當前姿態，只移 XYZ
         elif self._phase == 'moving_grasp':
             rot = [cur[0], cur[1], target['yaw_deg']]      # 保持 R/P，設定夾取 Yaw
+        elif self._phase == 'restoring':
+            rot = [cur[0], cur[1], target.get('yaw_deg', -135.0)]
         else:  # moving_sequence
             rot = [cur[0], cur[1], -135.0]                 # 保持 R/P，固定放置 Yaw
         self._log(f'MoveLinear 發送中... pos={[round(v,1) for v in pos]} yaw={rot[2]:.1f}°')
@@ -833,6 +873,26 @@ class AutoGrasp:
         self._handcam_dets = []
         self._last_handcam_t = 0.0
         self._set_phase('handcam_detecting', '🔍 手腕相機偵測中，等待穩定結果...')
+
+        if self._auto_mode:
+            # 自動模式：固定等 5s（讓 bbox 穩定），再取最新結果
+            def _handcam_timer():
+                time.sleep(_HANDCAM_DETECT_WAIT_S)
+                if self._phase != 'handcam_detecting':
+                    return
+                if self._handcam_selected is not None:
+                    pos_b = self._handcam_selected.get('pos_base_mm', [0, 0, 0])
+                    txt = (
+                        f'手腕相機偵測結果（5s 穩定等待後）：\n'
+                        f'  pos_base = {[round(v, 1) for v in pos_b]}\n'
+                        f'  yaw = {round(self._handcam_selected.get("yaw_base_deg") or 0, 1)}°'
+                    )
+                    self._set_phase('confirm_handcam', txt)
+                else:
+                    self._set_phase('stopped',
+                        '⚠ 手腕相機 5s 內未偵測到器械，流程停止')
+            threading.Thread(target=_handcam_timer, daemon=True,
+                             name='handcam_5s_timer').start()
 
     def _process_handcam(self) -> None:
         """
@@ -909,7 +969,7 @@ class AutoGrasp:
 
         first = self._which_first_h.get_first(dets)
         if first:
-            self._handcam_selected = first
+            self._handcam_selected = first   # 持續更新最新偵測結果
             pos_b      = first.get('pos_base_mm', [0, 0, 0])
             raw_angle  = first.get('angle_deg', 0.0)
             yaw_offset = self._handcam_a2y.offset_deg
@@ -924,11 +984,14 @@ class AutoGrasp:
                 f'  ★ 2D 傾角（fitEllipse） = {round(raw_angle, 1)}°\n'
                 f'  ★ HandcamAngle2Yaw     = -({round(raw_angle, 1)}°) + offset({yaw_offset:+.1f}°) → {round(yaw_final, 1)}°\n'
                 f'  ★ T_matrix Rz          = {round(yaw_tmat, 1) if yaw_tmat is not None else "N/A"}°\n'
-                f'\n'
-                f'請手動對齊後記錄實際 Rz，比對上方 2D 傾角\n'
-                f'按「確認繼續」計算夾取位姿'
             )
-            self._set_phase('confirm_handcam', txt)
+            if not self._auto_mode:
+                # 手動模式：偵測到立即切換等待確認
+                self._set_phase('confirm_handcam',
+                                txt + '\n請手動對齊後記錄實際 Rz，比對上方 2D 傾角\n按「確認繼續」計算夾取位姿')
+            else:
+                # 自動模式：靜默更新 log，由 5s timer 統一取結果
+                self._log(f'[手腕相機] 更新偵測 pos={[round(v,1) for v in pos_b]} yaw={round(yaw_final,1)}°')
 
     def _step_compute_grasp(self) -> None:
         source = self._handcam_selected or self._auto_selected
@@ -939,6 +1002,7 @@ class AutoGrasp:
         if grasp_target is None:
             self._set_phase('stopped', '❌ TargetConsiderGripper 失敗')
             return
+        grasp_target = self._grasp_z_ovr.apply(grasp_target)
         if grasp_target['z_mm'] < self._grasp_z_limit:
             self._set_phase('detecting',
                 f'⚠ 目標 z={grasp_target["z_mm"]:.1f}mm 低於安全下限'
@@ -976,7 +1040,10 @@ class AutoGrasp:
         threading.Thread(target=_do, daemon=True).start()
 
     def _step_record_and_compute_place(self) -> None:
-        slot  = self._mem.record(self._auto_selected)
+        # 優先記錄手腕相機偵測到的實際位置（pos_base_mm 最精確）
+        # 僅在 handcam 未偵測時才退回頭部相機結果
+        record_src = self._handcam_selected if self._handcam_selected else self._auto_selected
+        slot  = self._mem.record(record_src)
         count = self._mem.total_recorded
         put_site = self._put_site.get(count)
         if put_site is None:
@@ -1037,7 +1104,17 @@ class AutoGrasp:
     def _step_after_home(self) -> None:
         count = self._mem.total_recorded
         if count >= 3:
-            self._set_phase('complete', f'✅ 已完成 {count} 個器械夾取！')
+            self._log('✅ 已完成 3 個器械夾取')
+            if self._auto_mode:
+                self._log(f'⏳ Home 位姿等待 {_HOME_RESTORE_WAIT_S:.0f}s 後開始還原...')
+                def _wait_restore():
+                    time.sleep(_HOME_RESTORE_WAIT_S)
+                    self._start_restore_sequence()
+                threading.Thread(target=_wait_restore, daemon=True).start()
+            else:
+                self._log('開始還原器械...')
+                self._start_restore_sequence()
+            return
         else:
             self._log(f'已完成 {count}/3，回到偵測繼續下一個')
             yolo_ready = (self._head_detector.is_loaded and
@@ -1055,6 +1132,66 @@ class AutoGrasp:
                 threading.Thread(target=self._stub_detecting, daemon=True).start()
                 self._set_phase('detecting',
                     f'⚠ Stub 模式（{", ".join(reason)}）\n等待手臂位置...')
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 器械還原序列
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _start_restore_sequence(self) -> None:
+        """計算還原序列並開始執行（三支器械逆序夾回托盤）。"""
+        put_sites        = [self._put_site.get(i + 1) for i in range(3)]
+        original_records = [self._mem.get(i) for i in range(3)]
+        return_z_mm      = self._grasp_z_ovr.z_mm
+        home_target      = self._home_seq.home_pose
+
+        self._restore_queue = self._restore_seq.compute(
+            put_sites, original_records, return_z_mm, home_target)
+
+        if not self._restore_queue:
+            self._set_phase('restore_complete', '✅ 器械已全數還原')
+            return
+
+        self._set_phase('restoring', f'🔄 還原器械中（共 {len(self._restore_queue)} 步）...')
+        self._execute_next_restore_action()
+
+    def _execute_next_restore_action(self) -> None:
+        """從還原佇列取出下一個動作並執行。"""
+        if not self._restore_queue:
+            self._mem.clear()
+            self._mem.reset_counter()
+            if self._auto_mode:
+                self._set_phase('restore_complete',
+                                f'✅ 器械已全數還原，{_HOME_RESTORE_WAIT_S:.0f}s 後自動開始下一輪...')
+                def _auto_restart():
+                    time.sleep(_HOME_RESTORE_WAIT_S)
+                    self._on_start()
+                threading.Thread(target=_auto_restart, daemon=True).start()
+            else:
+                self._set_phase('restore_complete', '✅ 器械已全數還原，可開始下一輪')
+            return
+
+        action = self._restore_queue.pop(0)
+
+        if action['type'] == 'move':
+            self._auto_target = action['target']
+            self._step_start_moving('restoring', self._execute_next_restore_action)
+
+        elif action['type'] == 'close_gripper':
+            self._setup_gripper()
+            def _close():
+                ok = self._gripper.close()
+                self._log(f'還原：夾爪閉合 {"✅" if ok else "❌"}')
+                time.sleep(1.0)
+                self._execute_next_restore_action()
+            threading.Thread(target=_close, daemon=True).start()
+
+        elif action['type'] == 'open_gripper':
+            def _open():
+                ok = self._gripper.open()
+                self._log(f'還原：夾爪張開 {"✅" if ok else "❌"}')
+                time.sleep(1.0)
+                self._execute_next_restore_action()
+            threading.Thread(target=_open, daemon=True).start()
 
     def _setup_gripper(self) -> None:
         node = get_ros2_node(self._domain_id)

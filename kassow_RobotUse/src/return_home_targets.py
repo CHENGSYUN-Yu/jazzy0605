@@ -29,9 +29,9 @@ Home 位姿（base frame）：
 
 
 # Home 位姿（base frame，mm）
-_HOME_X   = 448.5
-_HOME_Y   = -245.4
-_HOME_Z   =   69.7
+_HOME_X   = 685.1
+_HOME_Y   = -245.5
+_HOME_Z   =  69.7
 _HOME_YAW =    0.0
 
 
