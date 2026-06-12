@@ -1,9 +1,11 @@
+import cv2
 import dearpygui.dearpygui as dpg
 import math
 import numpy as np
 import os
 import subprocess
 import threading
+import time
 
 from src.arm_controller import (ArmController, _NEGATE_FOR_VIEWER,
                                _LEFT_JOINT_LABELS, _RIGHT_JOINT_LABELS)
@@ -123,6 +125,22 @@ class App:
         # 目前擷取解析度（材質尺寸）
         self._tex_w, self._tex_h = 1280, 720
 
+        # 錄影狀態（頭部相機 cam0）
+        self._recording       = False
+        self._record_stop     = threading.Event()
+        self._record_thread   = None
+        self._record_fps      = 30.0
+        _RECORD_DIR = '/home/bf-robotics/jazzy0605/image_get_to_train_yolo'
+        os.makedirs(_RECORD_DIR, exist_ok=True)
+        self._record_dir      = _RECORD_DIR
+
+        # 錄影狀態（手部相機 cam1）
+        self._recording1      = False
+        self._record1_stop    = threading.Event()
+        self._record1_thread  = None
+        self._record1_fps     = 30.0
+        self._record1_writer  = None
+
         self._rs = RealSense(width=self._tex_w, height=self._tex_h, fps=30)
 
         self._rv = RobotViewer()   # render thread starts automatically
@@ -183,6 +201,8 @@ class App:
 
     def cleanup(self) -> None:
         """關閉視窗時釋放所有資源。"""
+        self._stop_recording()
+        self._stop_recording1()
         self._logger.log("[INFO] 程式關閉，釋放所有資源...")
         # YOLO 偵測器由 auto_grasp.cleanup() 停止
         self._auto_grasp.cleanup()
@@ -406,6 +426,9 @@ class App:
                     self._build_ros2_tab()
                 with dpg.tab(label="Settings"):
                     self._build_settings_tab()
+                with dpg.tab(label="錄影"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        self._build_record_tab()
 
     def _build_jog_tab(self) -> None:
         L = self._layout
@@ -895,6 +918,243 @@ class App:
 
         dpg.add_spacer(height=10)
         dpg.add_button(label="Save Settings", callback=lambda: None)
+
+    # =========================================================================
+    # 錄影分頁
+    # =========================================================================
+
+    def _build_record_tab(self) -> None:
+        iw = self._layout["ctrl_panel_w"] - 40
+        dpg.add_spacer(height=8)
+        dpg.add_text("Cam 0 (頭部 D435I) 錄影", color=(100, 200, 255))
+        dpg.add_separator()
+        dpg.add_spacer(height=6)
+
+        dpg.add_text("存檔目錄：", color=(200, 200, 100))
+        dpg.add_input_text(
+            tag="rec_dir_label",
+            default_value=self._record_dir,
+            readonly=True, width=iw,
+        )
+        dpg.add_spacer(height=8)
+
+        with dpg.group(horizontal=True):
+            dpg.add_text("錄影 FPS：", color=(200, 200, 100))
+            dpg.add_slider_float(
+                tag="rec_fps_slider",
+                default_value=30.0,
+                min_value=1.0, max_value=30.0,
+                width=200, format="%.0f fps",
+            )
+        dpg.add_spacer(height=12)
+
+        dpg.add_button(
+            label="⏺  開始錄影",
+            tag="rec_toggle_btn",
+            width=200, height=50,
+            callback=self._on_record_toggle,
+        )
+        dpg.add_spacer(height=10)
+
+        dpg.add_text("● 未錄影", tag="rec_status_label", color=(160, 160, 160))
+        dpg.add_spacer(height=4)
+        dpg.add_text("幀數：0", tag="rec_frame_label", color=(180, 180, 180))
+        dpg.add_text("時長：0.0 s", tag="rec_time_label", color=(180, 180, 180))
+        dpg.add_spacer(height=8)
+        dpg.add_text("上次存檔：", color=(200, 200, 100))
+        dpg.add_input_text(
+            tag="rec_file_label",
+            default_value="—",
+            readonly=True, width=iw,
+        )
+
+        # ── 手部相機 cam1 ─────────────────────────────────────────────────────
+        dpg.add_spacer(height=16)
+        dpg.add_separator()
+        dpg.add_spacer(height=8)
+        dpg.add_text("Cam 1 (手部 D405) 錄影", color=(100, 255, 180))
+        dpg.add_separator()
+        dpg.add_spacer(height=6)
+
+        dpg.add_text("存檔目錄：", color=(200, 200, 100))
+        dpg.add_input_text(
+            tag="rec1_dir_label",
+            default_value=self._record_dir,
+            readonly=True, width=iw,
+        )
+        dpg.add_spacer(height=8)
+
+        with dpg.group(horizontal=True):
+            dpg.add_text("錄影 FPS：", color=(200, 200, 100))
+            dpg.add_slider_float(
+                tag="rec1_fps_slider",
+                default_value=30.0,
+                min_value=1.0, max_value=30.0,
+                width=200, format="%.0f fps",
+            )
+        dpg.add_spacer(height=12)
+
+        dpg.add_button(
+            label="⏺  開始錄影",
+            tag="rec1_toggle_btn",
+            width=200, height=50,
+            callback=self._on_record1_toggle,
+        )
+        dpg.add_spacer(height=10)
+
+        dpg.add_text("● 未錄影", tag="rec1_status_label", color=(160, 160, 160))
+        dpg.add_spacer(height=4)
+        dpg.add_text("幀數：0", tag="rec1_frame_label", color=(180, 180, 180))
+        dpg.add_text("時長：0.0 s", tag="rec1_time_label", color=(180, 180, 180))
+        dpg.add_spacer(height=8)
+        dpg.add_text("上次存檔：", color=(200, 200, 100))
+        dpg.add_input_text(
+            tag="rec1_file_label",
+            default_value="—",
+            readonly=True, width=iw,
+        )
+
+    def _on_record_toggle(self) -> None:
+        if self._recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self) -> None:
+        if self._recording:
+            return
+        fps = float(dpg.get_value("rec_fps_slider")) if dpg.does_item_exist("rec_fps_slider") else 30.0
+        self._record_fps = fps
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename  = os.path.join(self._record_dir, f"record_{timestamp}.mp4")
+        fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
+        self._record_writer = cv2.VideoWriter(
+            filename, fourcc, fps, (self._tex_w, self._tex_h))
+        if not self._record_writer.isOpened():
+            if dpg.does_item_exist("rec_status_label"):
+                dpg.set_value("rec_status_label", "❌ VideoWriter 開啟失敗")
+                dpg.configure_item("rec_status_label", color=(220, 80, 80))
+            return
+        self._recording = True
+        self._record_stop.clear()
+        self._record_thread = threading.Thread(
+            target=self._record_loop, args=(filename,),
+            daemon=True, name="record_cam0")
+        self._record_thread.start()
+        if dpg.does_item_exist("rec_toggle_btn"):
+            dpg.configure_item("rec_toggle_btn", label="⏹  停止錄影")
+        if dpg.does_item_exist("rec_status_label"):
+            dpg.set_value("rec_status_label", "🔴 錄影中...")
+            dpg.configure_item("rec_status_label", color=(220, 80, 80))
+
+    def _stop_recording(self) -> None:
+        if not self._recording:
+            return
+        self._record_stop.set()
+        self._recording = False
+        if self._record_thread and self._record_thread.is_alive():
+            self._record_thread.join(timeout=3.0)
+        if self._record_writer:
+            self._record_writer.release()
+            self._record_writer = None
+        if dpg.does_item_exist("rec_toggle_btn"):
+            dpg.configure_item("rec_toggle_btn", label="⏺  開始錄影")
+        if dpg.does_item_exist("rec_status_label"):
+            dpg.set_value("rec_status_label", "● 已停止")
+            dpg.configure_item("rec_status_label", color=(160, 160, 160))
+
+    def _record_loop(self, filename: str) -> None:
+        interval   = 1.0 / self._record_fps
+        frame_count = 0
+        t_start    = time.perf_counter()
+        while not self._record_stop.is_set():
+            t0    = time.perf_counter()
+            frame = self._rs.get_frame(0)
+            if frame is not None and self._record_writer is not None:
+                self._record_writer.write(frame)
+                frame_count += 1
+                elapsed = time.perf_counter() - t_start
+                if dpg.does_item_exist("rec_frame_label"):
+                    dpg.set_value("rec_frame_label", f"幀數：{frame_count}")
+                if dpg.does_item_exist("rec_time_label"):
+                    dpg.set_value("rec_time_label", f"時長：{elapsed:.1f} s")
+            wait = interval - (time.perf_counter() - t0)
+            if wait > 0:
+                time.sleep(wait)
+        if dpg.does_item_exist("rec_file_label"):
+            dpg.set_value("rec_file_label", filename)
+
+    # ── 手部相機 cam1 錄影 ────────────────────────────────────────────────────
+
+    def _on_record1_toggle(self) -> None:
+        if self._recording1:
+            self._stop_recording1()
+        else:
+            self._start_recording1()
+
+    def _start_recording1(self) -> None:
+        if self._recording1:
+            return
+        fps = float(dpg.get_value("rec1_fps_slider")) if dpg.does_item_exist("rec1_fps_slider") else 30.0
+        self._record1_fps = fps
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename  = os.path.join(self._record_dir, f"record_hand_{timestamp}.mp4")
+        fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
+        self._record1_writer = cv2.VideoWriter(
+            filename, fourcc, fps, (self._tex_w, self._tex_h))
+        if not self._record1_writer.isOpened():
+            if dpg.does_item_exist("rec1_status_label"):
+                dpg.set_value("rec1_status_label", "❌ VideoWriter 開啟失敗")
+                dpg.configure_item("rec1_status_label", color=(220, 80, 80))
+            return
+        self._recording1 = True
+        self._record1_stop.clear()
+        self._record1_thread = threading.Thread(
+            target=self._record1_loop, args=(filename,),
+            daemon=True, name="record_cam1")
+        self._record1_thread.start()
+        if dpg.does_item_exist("rec1_toggle_btn"):
+            dpg.configure_item("rec1_toggle_btn", label="⏹  停止錄影")
+        if dpg.does_item_exist("rec1_status_label"):
+            dpg.set_value("rec1_status_label", "🔴 錄影中...")
+            dpg.configure_item("rec1_status_label", color=(220, 80, 80))
+
+    def _stop_recording1(self) -> None:
+        if not self._recording1:
+            return
+        self._record1_stop.set()
+        self._recording1 = False
+        if self._record1_thread and self._record1_thread.is_alive():
+            self._record1_thread.join(timeout=3.0)
+        if self._record1_writer:
+            self._record1_writer.release()
+            self._record1_writer = None
+        if dpg.does_item_exist("rec1_toggle_btn"):
+            dpg.configure_item("rec1_toggle_btn", label="⏺  開始錄影")
+        if dpg.does_item_exist("rec1_status_label"):
+            dpg.set_value("rec1_status_label", "● 已停止")
+            dpg.configure_item("rec1_status_label", color=(160, 160, 160))
+
+    def _record1_loop(self, filename: str) -> None:
+        interval    = 1.0 / self._record1_fps
+        frame_count = 0
+        t_start     = time.perf_counter()
+        while not self._record1_stop.is_set():
+            t0    = time.perf_counter()
+            frame = self._rs.get_frame(1)
+            if frame is not None and self._record1_writer is not None:
+                self._record1_writer.write(frame)
+                frame_count += 1
+                elapsed = time.perf_counter() - t_start
+                if dpg.does_item_exist("rec1_frame_label"):
+                    dpg.set_value("rec1_frame_label", f"幀數：{frame_count}")
+                if dpg.does_item_exist("rec1_time_label"):
+                    dpg.set_value("rec1_time_label", f"時長：{elapsed:.1f} s")
+            wait = interval - (time.perf_counter() - t0)
+            if wait > 0:
+                time.sleep(wait)
+        if dpg.does_item_exist("rec1_file_label"):
+            dpg.set_value("rec1_file_label", filename)
 
     # =========================================================================
     # 相機連線回呼

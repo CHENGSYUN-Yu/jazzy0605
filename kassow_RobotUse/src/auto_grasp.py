@@ -53,7 +53,8 @@ from src.ros2_node           import get_ros2_node
 
 # ── 路徑 ──────────────────────────────────────────────────────────────────────
 _BASE = os.path.join(os.path.dirname(__file__), '..')
-MODEL_PATH    = os.path.join(_BASE, 'models', 'best20260603.pt')
+HEAD_MODEL_PATH = os.path.join(_BASE, 'models', 'best.pt')
+HAND_MODEL_PATH = os.path.join(_BASE, 'models', 'best20260603.pt')
 T_MATRIX_PATH = os.path.join(_BASE, 'T_matrix_20260603_head30.npy')   # 頭部相機→base
 EIH_T_PATH    = os.path.join(_BASE, 'T_cam2gripper_20260609_26point.npy')  # 手部相機→法蘭（暫時替換）
 
@@ -126,8 +127,8 @@ class AutoGrasp:
         self._domain_id  = domain_id
 
         # ── YOLO 偵測物件（各自獨立）─────────────────────────────────────────
-        self._head_detector = YoloEngine(MODEL_PATH, cam_id=0, fps=10.0)  # D435I 頭部
-        self._hand_detector = YoloEngine(MODEL_PATH, cam_id=1, fps=10.0)  # D405 手部
+        self._head_detector = YoloEngine(HEAD_MODEL_PATH, cam_id=0, fps=10.0)  # D435I 頭部
+        self._hand_detector = YoloEngine(HAND_MODEL_PATH, cam_id=1, fps=10.0)  # D405 手部
 
         # ── 目標位姿硬性補償（套用在 Cam2Flange 之前）────────────────────────
         self._pose_offset = PoseOffset(dx=25.0)   # 手部相機接近點 x +25mm
@@ -136,7 +137,7 @@ class AutoGrasp:
         self._handcam_a2y   = HandcamAngle2Yaw(offset_deg=-135.0)
 
         # ── 手腕相機物件鏈 ────────────────────────────────────────────────────
-        self._handcam_det   = YoloDetectHandcam(model_path=MODEL_PATH)
+        self._handcam_det   = YoloDetectHandcam(model_path=HAND_MODEL_PATH)
         self._handcam_depth = GetDepthHandcam()
         self._p2h           = Pixel2HandCam()
         self._h2f           = HandCam2Flange()
@@ -172,7 +173,7 @@ class AutoGrasp:
         self._tcg           = TargetConsiderGripper(gripper_length_mm=100.0)
         self._mem           = MemoryInstrumentPoint()
         self._put_site      = PutSiteGet()
-        self._grasp_z_ovr   = GraspZOverride(z_mm=-398.2, enabled=True)
+        self._grasp_z_ovr   = GraspZOverride(z_mm=-394.5, enabled=True)
         self._restore_seq   = RestoreInstrumentSequence(approach_offset_mm=300.0)
         self._restore_queue: list = []
         self._place_seq     = PlaceSequenceTargets(lift_z_mm=200.0)
@@ -397,7 +398,7 @@ class AutoGrasp:
             dpg.add_text('MoveLinear 速度 (mm/s)：', color=(180, 180, 180))
             dpg.add_slider_float(
                 tag='ag_move_speed',
-                default_value=130.0,
+                default_value=200.0,
                 min_value=5.0, max_value=200.0,
                 width=iw, format='%.0f mm/s',
             )
